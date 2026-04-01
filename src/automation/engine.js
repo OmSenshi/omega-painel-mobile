@@ -1,7 +1,12 @@
 // src/automation/engine.js v2.1 — Correções + Arrendamento avulso + Inclusão avulsa
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const RecaptchaPlugin = require('puppeteer-extra-plugin-recaptcha');
 puppeteer.use(StealthPlugin());
+puppeteer.use(RecaptchaPlugin({
+  provider: { id: '2captcha', token: process.env.CAPTCHA_API_KEY || '' },
+  visualFeedback: true
+}));
 const path = require('path');
 const fs = require('fs');
 
@@ -131,59 +136,102 @@ class AutomationEngine {
     } finally { await this.cleanup(); }
   }
 
-  // ═══ LOGIN SEMI-MANUAL via noVNC ═══
+  // ═══ LOGIN AUTOMATICO (2captcha) + FALLBACK noVNC ═══
   async stepLogin(tipo,cred) {
     this.currentStep='login';
-    const vncPort = process.env.VNC_PORT || '6080';
+    this.emit('step',{message:'Fazendo login...'});
+
+    // Nega permissão de localização
+    const ctx = this.browser.defaultBrowserContext();
+    await ctx.overridePermissions('https://sso.acesso.gov.br', []);
 
     await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
 
-    this.emit('step',{message:'Portal aberto no noVNC. Faca login manualmente.'});
+    let cpf,senha;
+    if(tipo==='cnpj'){cpf=process.env.COLAB_CPF||cred.cpf;senha=process.env.COLAB_SENHA||cred.senha;}
+    else{cpf=(cred.cpf||'').replace(/\D/g,'');senha=cred.senha||'';}
 
-    // Pausa com instrucoes — enquanto espera, faz polling pra detectar login automaticamente
-    let loggedIn = false;
-
-    // Inicia polling em background
-    const pollInterval = setInterval(async () => {
-      try {
-        const url = this.page.url();
-        // Se saiu do gov.br e esta no portal ANTT = logou
-        if (url.includes('rntrcdigital.antt.gov.br') && !url.includes('acesso.gov.br')) {
-          loggedIn = true;
-          // Se ainda esta pausado, resume automaticamente
-          if (this._pauseResolve) {
-            this._pauseResolve('fix');
-            this._pauseResolve = null;
-          }
-        }
-      } catch {}
-    }, 2000);
-
-    if (!loggedIn) {
-      const action = await this.pauseForError(
-        'Acesse o noVNC (porta ' + vncPort + ') e faca login no gov.br. O sistema detecta automaticamente quando voce logar, ou clique "Corrigir" quando terminar.',
-        'login_novnc',
-        'Aguardando...'
-      );
-      if (action === 'stop') { clearInterval(pollInterval); return; }
+    // Campo CPF = #accountId
+    if(!await this.waitFor('#accountId',20000)){
+      const a=await this.pauseForError('Campo CPF nao encontrado. Verifique pelo noVNC.','cpf',cpf);
+      if(a==='stop')return;
     }
 
-    clearInterval(pollInterval);
+    // Abre accordion
+    await this.page.evaluate(()=>{const p=document.getElementById('accordion-panel-id');if(p&&!p.style.maxHeight){const b=document.querySelector('[onclick*="accordion"]');if(b)b.click();}});
+    await this.delay(500);
 
-    // Verifica mais uma vez
-    await this.delay(2000);
-    const url = this.page.url();
-    if (url.includes('acesso.gov.br') || url.includes('login')) {
-      const retry = await this.pauseForError(
-        'Login ainda nao detectado. URL atual: ' + url.substring(0,60) + '... Termine o login e clique "Corrigir".',
-        'login_novnc',
-        url
-      );
-      if (retry === 'stop') return;
+    // Digita CPF
+    await this.typeSlowly('#accountId',cpf,100);
+    this.emit('step',{message:'CPF digitado, resolvendo captcha...'});
+
+    // Resolve hCaptcha via 2captcha
+    try {
+      const {solved}=await this.page.solveRecaptchas();
+      if(solved&&solved.length>0) this.emit('step',{message:'hCaptcha resolvido!'});
+    } catch(e) {
+      this.emit('step',{message:'2captcha: '+e.message+'. Tentando sem...'});
     }
 
-    this.checkpoint.login = true;
-    this.emit('step_done',{message:'Login confirmado',step:'login'});
+    // Clica continuar
+    try {
+      await Promise.all([
+        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+        this.page.click('#enter-account-id')
+      ]);
+    } catch(e) {
+      this.emit('step',{message:'Aguardando redirect...'});
+      await this.delay(5000);
+    }
+
+    // Verifica tela de senha
+    const senhaOk=await this.poll(async()=>await this.page.evaluate(()=>!!document.querySelector('#password')),1000,20000);
+
+    if(!senhaOk) {
+      // Fallback noVNC
+      const a=await this.pauseForError(
+        'Captcha pode ter bloqueado. Faca login pelo noVNC e clique Corrigir, ou clique Parar.',
+        'login_novnc','Aguardando...'
+      );
+      if(a==='stop')return;
+      // Verifica se logou via noVNC
+      const u=this.page.url();
+      if(u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br')){
+        this.checkpoint.login=true;
+        this.emit('step_done',{message:'Login confirmado (noVNC)',step:'login'});
+        return;
+      }
+      // Se esta na tela de senha agora, continua
+      if(!await this.page.$('#password')){
+        this.checkpoint.login=true;
+        this.emit('step_done',{message:'Login confirmado',step:'login'});
+        return;
+      }
+    }
+
+    // Preenche senha
+    this.emit('step',{message:'Digitando senha...'});
+    await this.delay(1000);
+    await this.typeSlowly('#password',senha,60);
+    await this.delay(500);
+
+    // Clica entrar
+    try {
+      await Promise.all([
+        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+        this.page.click('#submit-button')
+      ]);
+    } catch(e) { await this.delay(3000); }
+
+    // Verifica login
+    const ok=await this.poll(async()=>{const u=this.page.url();return u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br');},1000,20000);
+    if(!ok){
+      const a=await this.pauseForError('Login pode ter falhado. Verifique pelo noVNC.','login_novnc','');
+      if(a==='stop')return;
+    }
+
+    this.checkpoint.login=true;
+    this.emit('step_done',{message:'Login realizado',step:'login'});
   }
 
   // ═══ CONTRATO — seletores reais do HTML ═══
