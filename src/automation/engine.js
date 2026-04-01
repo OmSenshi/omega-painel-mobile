@@ -270,101 +270,104 @@ class AutomationEngine {
     });
     this.emit('step',{message:'CPF digitado: '+cpfDigitado.substring(0,3)+'***'});
 
-    // ── ETAPA 4: Resolve hCaptcha via 2captcha API ──
-    this.emit('step',{message:'Resolvendo hCaptcha via 2captcha...'});
+    // ── ETAPA 4: Resolve hCaptcha via 2captcha API ANTES de clicar continuar ──
+    // O sitekey é fixo no HTML do gov.br (está no script onLoadHcaptcha)
+    const GOVBR_SITEKEY = '93b08d40-d46c-400a-ba07-6f91cda815b9';
+    this.emit('step',{message:'Resolvendo hCaptcha via 2captcha (pode levar 30-60s)...'});
 
+    let captchaToken = null;
     try {
-      // Extrai o sitekey do hCaptcha da página
+      // Tenta extrair sitekey dinamicamente, fallback pro fixo
       const sitekey = await this.page.evaluate(()=>{
-        // Procura no iframe do hcaptcha
-        const iframe = document.querySelector('iframe[src*="hcaptcha"]');
-        if(iframe) {
-          const src = iframe.getAttribute('src') || '';
-          const m = src.match(/sitekey=([a-f0-9-]+)/);
-          if(m) return m[1];
-        }
-        // Procura no div do hcaptcha
-        const div = document.querySelector('[data-sitekey]');
-        if(div) return div.getAttribute('data-sitekey');
-        // Procura no script
         const scripts = document.querySelectorAll('script');
         for(const s of scripts) {
           const t = s.textContent || '';
           const m = t.match(/sitekey:\s*["']([a-f0-9-]+)["']/);
           if(m) return m[1];
         }
+        const div = document.querySelector('[data-sitekey]');
+        if(div) return div.getAttribute('data-sitekey');
         return null;
+      }) || GOVBR_SITEKEY;
+
+      this.emit('step',{message:'Sitekey: '+sitekey.substring(0,12)+'... Aguardando 2captcha...'});
+
+      const result = await solver.hcaptcha({
+        sitekey: sitekey,
+        pageurl: this.page.url()
       });
 
-      if(sitekey) {
-        this.emit('step',{message:'Sitekey encontrado: '+sitekey.substring(0,8)+'... Enviando pro 2captcha...'});
-
-        // Resolve via API do 2captcha
-        const result = await solver.hcaptcha({
-          sitekey: sitekey,
-          pageurl: this.page.url()
-        });
-
-        if(result && result.data) {
-          this.emit('step',{message:'Token recebido! Injetando na página...'});
-
-          // Injeta o token na página
-          await this.page.evaluate((token)=>{
-            // Preenche o campo de resposta do hCaptcha
-            const textarea = document.querySelector('[name="h-captcha-response"], textarea[name*="captcha-response"]');
-            if(textarea) textarea.value = token;
-            // Também tenta via hcaptcha API global
-            if(window.hcaptcha) {
-              // Chama o callback do hCaptcha com o token
-              const cb = window.onHcaptchaCallback || window.hcaptchaCallback;
-              if(typeof cb === 'function') cb(token);
-            }
-          }, result.data);
-
-          await this.delay(1000);
-
-          // Agora submete o formulário
-          this.emit('step',{message:'Captcha resolvido! Submetendo...'});
-          await this.page.evaluate(()=>{
-            const form = document.getElementById('loginData');
-            if(form) form.submit();
-          });
-          await this.delay(5000);
-        } else {
-          this.emit('step',{message:'2captcha nao retornou token'});
-        }
-      } else {
-        // hCaptcha invisível pode não ter sitekey visível — tenta clicar direto
-        this.emit('step',{message:'Sitekey nao encontrado, clicando continuar direto...'});
-        await this.page.click('button#enter-account-id').catch(()=>{});
-        await this.delay(5000);
+      if(result && result.data) {
+        captchaToken = result.data;
+        this.emit('step',{message:'Token de captcha recebido!'});
       }
     } catch(e) {
-      this.emit('step',{message:'2captcha erro: '+e.message+'. Clicando continuar...'});
-      await this.page.click('button#enter-account-id').catch(()=>{});
-      await this.delay(5000);
+      this.emit('step',{message:'2captcha erro: '+e.message});
     }
 
-    // ── ETAPA 5: Detecta resultado ──
-    this.emit('step',{message:'Verificando resultado...'});
+    // ── ETAPA 5: Injeta token e submete ──
+    if(captchaToken) {
+      this.emit('step',{message:'Injetando token e submetendo formulário...'});
 
-    const screen = await this.poll(async()=>{
-      return await this.page.evaluate(()=>{
-        // Tela de senha = captcha resolvido e avançou
+      // Injeta o token no campo h-captcha-response e submete via callback
+      await this.page.evaluate((token)=>{
+        // Preenche TODOS os campos de resposta do hCaptcha
+        document.querySelectorAll('textarea[name*="captcha-response"], [name="h-captcha-response"]').forEach(el=>{
+          el.value = token;
+          el.textContent = token;
+        });
+
+        // Configura o campo de operação pro submit
+        const opField = document.getElementById('operation-field');
+        if(opField) {
+          opField.setAttribute('name', 'operation');
+          opField.setAttribute('value', 'enter-account-id');
+        }
+
+        // Submete o form diretamente (bypassa o clique no botão que dispara hCaptcha visual)
+        const form = document.getElementById('loginData');
+        if(form) form.submit();
+      }, captchaToken);
+
+    } else {
+      // Sem token — clica continuar e deixa o captcha visual aparecer (fallback noVNC)
+      this.emit('step',{message:'Sem token, clicando continuar (captcha visual vai aparecer)...'});
+      await this.page.click('button#enter-account-id').catch(()=>{});
+    }
+
+    // ── ETAPA 6: Aguarda resultado com waitForSelector obrigatório ──
+    this.emit('step',{message:'Aguardando tela de senha carregar (até 90s)...'});
+
+    // Primeiro tenta waitForSelector direto pro campo de senha (mais confiável que polling)
+    let screen = null;
+    try {
+      // Aguarda qualquer um destes aparecer: senha, 2FA, ou erro
+      await this.page.waitForFunction(()=>{
+        return document.querySelector('input#password[type="password"]') ||
+               document.querySelector('input#otpInput') ||
+               (window.location.href.includes('rntrcdigital.antt.gov.br') && !window.location.href.includes('acesso.gov.br'));
+      }, {timeout: 90000});
+
+      // Detecta qual tela apareceu
+      screen = await this.page.evaluate(()=>{
         if(document.querySelector('input#password[type="password"]')) return 'senha';
-        // 2FA
         if(document.querySelector('input#otpInput')) return '2fa';
-        // Já logou
         if(window.location.href.includes('rntrcdigital.antt.gov.br') && !window.location.href.includes('acesso.gov.br')) return 'logado';
-        // Erro de captcha (extensão falhou ou token expirou)
+        return 'desconhecido';
+      });
+    } catch(e) {
+      // Timeout — verifica se ficou no captcha ou outro erro
+      screen = await this.page.evaluate(()=>{
         const alertas = document.querySelectorAll('.alert-danger,.alert-warning');
         for(const a of alertas) {
           if((a.textContent||'').toLowerCase().includes('captcha')) return 'captcha_erro';
         }
-        // Ainda na tela de CPF = captcha sendo resolvido, continua polling
-        return null;
+        if(document.querySelector('input#accountId')) return 'cpf_ainda';
+        return 'timeout';
       });
-    }, 2000, 90000); // polling a cada 2s, timeout 90s (extensão pode demorar)
+    }
+
+    this.emit('step',{message:'Resultado: '+screen});
 
     // ── TRATA CADA CENÁRIO ──
     if(screen === 'logado') {
@@ -374,6 +377,8 @@ class AutomationEngine {
     }
 
     if(screen === 'senha') {
+      // Aguarda campo de senha ficar interagível por pelo menos 2s
+      await this.delay(2000);
       await this.loginSenha(senha);
       return;
     }
@@ -384,47 +389,9 @@ class AutomationEngine {
       return;
     }
 
-    if(screen === 'captcha_erro') {
-      this.emit('step',{message:'Captcha invalido. Recarregando e tentando novamente...'});
-      // Recarrega a pagina e tenta de novo (a extensão vai resolver automaticamente)
-      await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
-      await this.delay(3000);
-
-      // Expande accordion de novo
-      await this.page.evaluate(()=>{
-        const items = document.querySelectorAll('.item-login-signup-ways');
-        if(items[0]) items[0].click();
-        setTimeout(()=>{
-          const p = document.getElementById('accordion-panel-id');
-          if(p) { p.style.maxHeight = p.scrollHeight+'px'; p.style.overflow='visible'; }
-        }, 500);
-      });
-      await this.delay(2000);
-
-      // Digita CPF de novo
-      await this.page.evaluate(()=>{ const el=document.getElementById('accountId'); if(el){el.value='';el.focus();} });
-      await this.delay(300);
-      const cpfRetry = await this.page.$('input#accountId');
-      if(cpfRetry) await this.typeInEl(cpfRetry, cpf, 80);
-      await this.delay(500);
-
-      // Clica continuar de novo (extensão resolve captcha)
-      await this.page.click('button#enter-account-id').catch(()=>{});
-
-      // Aguarda de novo
-      const retry = await this.poll(async()=>{
-        return await this.page.evaluate(()=>{
-          if(document.querySelector('input#password[type="password"]')) return 'senha';
-          if(document.querySelector('input#otpInput')) return '2fa';
-          if(window.location.href.includes('rntrcdigital.antt.gov.br')&&!window.location.href.includes('acesso.gov.br')) return 'logado';
-          return null;
-        });
-      }, 2000, 90000);
-
-      if(retry==='senha') { await this.loginSenha(senha); return; }
-      if(retry==='2fa') { await this.handle2FA(); await this.verificaLoginFinal(); return; }
-      if(retry==='logado') { this.checkpoint.login=true; this.emit('step_done',{message:'Login realizado!',step:'login'}); return; }
-    }
+    // Captcha falhou, timeout, ou ainda na tela de CPF — fallback noVNC
+    if(screen === 'captcha_erro' || screen === 'cpf_ainda' || screen === 'timeout' || screen === 'desconhecido') {
+      this.emit('step',{message:'Login travou ('+screen+'). Use o noVNC pra completar.'});
 
     // Fallback noVNC
     const a=await this.pauseForError(
