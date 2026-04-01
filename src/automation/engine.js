@@ -1,5 +1,7 @@
 // src/automation/engine.js v2.1 — Correções + Arrendamento avulso + Inclusão avulsa
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const path = require('path');
 const fs = require('fs');
 
@@ -88,7 +90,17 @@ class AutomationEngine {
     this.browser = await puppeteer.launch({
       headless:'new',
       executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
-      args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--window-size=1366,768']
+      args:[
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--window-size=1366,768',
+        '--disable-blink-features=AutomationControlled',
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      ]
+    });
+    // Anti-deteccao: remove webdriver flag
+    await this.page.evaluateOnNewDocument(()=>{
+      Object.defineProperty(navigator,'webdriver',{get:()=>false});
+      window.chrome={runtime:{}};
+      window.navigator.permissions={query:p=>Promise.resolve({state:'granted'})};
     });
     this.page = await this.browser.newPage();
     await this.page.setViewport({width:1366,height:768});
@@ -133,15 +145,47 @@ class AutomationEngine {
     await this.typeSlowly('#accountId',cpf,100);
     this.emit('step',{message:'CPF digitado, clicando continuar...'});
     // Submete — hCaptcha invisivel vai processar automaticamente
-    await this.page.click('#enter-account-id').catch(()=>{});
-    await this.delay(5000); // hCaptcha + redirect
+    // Submete via click — hCaptcha invisivel processa em background
+    // Usa waitForNavigation pra aguardar redirect real
+    try {
+      await Promise.all([
+        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+        this.page.click('#enter-account-id')
+      ]);
+    } catch(e) {
+      // Se timeout, pode ser hCaptcha bloqueando — tenta aguardar mais
+      this.emit('step',{message:'Aguardando hCaptcha...'});
+      await this.delay(5000);
+      // Verifica se a pagina mudou
+      const stillCpf = await this.page.$('#accountId');
+      if(stillCpf) {
+        // Ainda na tela de CPF — hCaptcha pode ter bloqueado
+        // Tenta submeter o form diretamente
+        await this.page.evaluate(()=>{
+          document.getElementById('loginData').submit();
+        });
+        await this.delay(5000);
+      }
+    }
     // Tela de senha: campo = #password, botao = #submit-button
-    if(!await this.waitFor('#password',20000)){const a=await this.pauseForError('Campo senha nao encontrado (gov.br)','senha','');if(a==='stop')return;}
+    // Aguarda com timeout generoso (hCaptcha pode demorar)
+    const senhaOk = await this.poll(async()=>{
+      return await this.page.evaluate(()=>!!document.querySelector('#password'));
+    },1000,30000);
+    if(!senhaOk){const a=await this.pauseForError('Tela de senha nao carregou — hCaptcha pode ter bloqueado. Tente novamente.','senha','');if(a==='stop')return;}
     this.emit('step',{message:'Tela de senha carregou, digitando...'});
+    await this.delay(1000);
     await this.typeSlowly('#password',senha,60);
     await this.delay(500);
-    await this.page.click('#submit-button').catch(()=>{});
-    await this.delay(5000);
+    // Submit senha — nao tem hCaptcha na tela de senha
+    try {
+      await Promise.all([
+        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+        this.page.click('#submit-button')
+      ]);
+    } catch(e) {
+      await this.delay(3000);
+    }
     // Verifica se login foi bem sucedido (sai do sso.acesso.gov.br)
     const ok=await this.poll(async()=>{const u=this.page.url();return u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br');},1000,30000);
     if(!ok){const a=await this.pauseForError('Login falhou — verifique CPF e senha','senha','');if(a==='stop')return;}
