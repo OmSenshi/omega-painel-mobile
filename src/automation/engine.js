@@ -107,18 +107,29 @@ class AutomationEngine {
   async initBrowser() {
     this.emit('starting',{message:'Iniciando navegador...'});
     const useDisplay = process.env.DISPLAY || ':99';
-    // SEM --incognito e SEM createBrowserContext — ambos quebram cookies do gov.br
+    const extPath = path.join(__dirname, '..', '..', 'extensions', '2captcha-solver');
+    const hasExt = fs.existsSync(extPath);
+
+    const args = [
+      '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+      '--window-size=1366,768','--start-maximized',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      '--display=' + useDisplay
+    ];
+
+    // Carrega extensão 2captcha-solver se existir
+    if(hasExt) {
+      args.push('--disable-extensions-except=' + extPath);
+      args.push('--load-extension=' + extPath);
+      this.emit('starting',{message:'Extensão 2captcha-solver carregada'});
+    }
+
     this.browser = await puppeteer.launch({
       headless: false,
       executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
-      args:[
-        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-        '--window-size=1366,768','--start-maximized',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        '--display=' + useDisplay
-      ]
+      args
     });
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
@@ -131,6 +142,18 @@ class AutomationEngine {
     await ctx.overridePermissions('https://sso.acesso.gov.br', []);
     const c = await this.page.createCDPSession();
     await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
+
+    // Fecha abas extras que a extensão pode abrir
+    if(hasExt) {
+      await this.delay(2000);
+      const allPages = await this.browser.pages();
+      for(const p of allPages) {
+        const url = p.url();
+        if(url.includes('chrome-extension://') || url === 'about:blank') {
+          if(p !== this.page) await p.close().catch(()=>{});
+        }
+      }
+    }
   }
 
   // ═══ FLUXO PRINCIPAL ═══
@@ -274,56 +297,36 @@ class AutomationEngine {
     });
     this.emit('step',{message:'CPF digitado: '+cpfDigitado.substring(0,3)+'***'});
 
-    // ── ETAPA 4: Resolve hCaptcha via 2captcha ──
-    this.emit('step',{message:'Resolvendo captcha (2captcha)...'});
-    let captchaSolved = false;
-    try {
-      // solveRecaptchas resolve hCaptcha tambem (desde v3.3)
-      const result = await this.page.solveRecaptchas();
-      if(result.solved && result.solved.length > 0) {
-        captchaSolved = true;
-        this.emit('step',{message:'Captcha resolvido pelo 2captcha!'});
-      } else {
-        this.emit('step',{message:'2captcha: nenhum captcha encontrado na pagina'});
-      }
-    } catch(e) {
-      this.emit('step',{message:'2captcha erro: '+e.message});
-    }
+    // ── ETAPA 4: Clica Continuar ──
+    // A extensão 2captcha-solver resolve o captcha automaticamente em background
+    // Quando o hCaptcha aparece, a extensão detecta, envia pro 2captcha, e preenche sozinha
+    this.emit('step',{message:'Clicando Continuar (captcha será resolvido automaticamente)...'});
 
-    // ── ETAPA 5: Clica Continuar e aguarda navegação ──
-    this.emit('step',{message:'Clicando Continuar...'});
+    // Clica no botão continuar — isso dispara o hCaptcha
+    await this.page.click('button#enter-account-id').catch(()=>{});
 
-    // Clica no botão exato: button#enter-account-id
-    try {
-      await Promise.all([
-        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:45000}),
-        this.page.click('button#enter-account-id')
-      ]);
-    } catch(e) {
-      // Se navigation timeout, pode ser que o captcha bloqueou
-      this.emit('step',{message:'Navegacao demorou, verificando...'});
-      await this.delay(3000);
-    }
+    // ── ETAPA 5: Aguarda extensão resolver captcha + navegação ──
+    // A extensão precisa de 15-60 segundos pra resolver
+    // Poll até sair da tela de CPF ou detectar erro
+    this.emit('step',{message:'Aguardando resolução do captcha (pode levar até 60s)...'});
 
-    // ── ETAPA 6: Detecta resultado — polling robusto ──
-    this.emit('step',{message:'Verificando resultado do login...'});
-
-    // Poll por até 30s pra detectar em qual tela estamos
     const screen = await this.poll(async()=>{
       return await this.page.evaluate(()=>{
-        // Seletor exato da tela de senha
+        // Tela de senha = captcha resolvido e avançou
         if(document.querySelector('input#password[type="password"]')) return 'senha';
-        // Seletor exato do 2FA
+        // 2FA
         if(document.querySelector('input#otpInput')) return '2fa';
-        // Já logou no portal ANTT
+        // Já logou
         if(window.location.href.includes('rntrcdigital.antt.gov.br') && !window.location.href.includes('acesso.gov.br')) return 'logado';
-        // Erro de captcha (ainda na mesma tela com mensagem de erro)
-        if(document.querySelector('.alert-danger') || document.body.innerText.includes('Captcha inválido')) return 'captcha_erro';
-        // Ainda na tela de CPF
-        if(document.querySelector('input#accountId')) return null; // continua polling
+        // Erro de captcha (extensão falhou ou token expirou)
+        const alertas = document.querySelectorAll('.alert-danger,.alert-warning');
+        for(const a of alertas) {
+          if((a.textContent||'').toLowerCase().includes('captcha')) return 'captcha_erro';
+        }
+        // Ainda na tela de CPF = captcha sendo resolvido, continua polling
         return null;
       });
-    }, 1000, 30000);
+    }, 2000, 90000); // polling a cada 2s, timeout 90s (extensão pode demorar)
 
     // ── TRATA CADA CENÁRIO ──
     if(screen === 'logado') {
@@ -344,21 +347,41 @@ class AutomationEngine {
     }
 
     if(screen === 'captcha_erro') {
-      this.emit('step',{message:'Captcha invalido. Tentando resolver novamente...'});
-      // Tenta resolver captcha de novo
-      try {
-        await this.page.solveRecaptchas();
-        await this.page.click('button#enter-account-id');
-        await this.delay(10000);
-      } catch(e) {}
+      this.emit('step',{message:'Captcha invalido. Recarregando e tentando novamente...'});
+      // Recarrega a pagina e tenta de novo (a extensão vai resolver automaticamente)
+      await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
+      await this.delay(3000);
 
-      // Se ainda não avançou, fallback noVNC
-      const retry = await this.page.evaluate(()=>{
-        if(document.querySelector('input#password[type="password"]')) return 'senha';
-        if(document.querySelector('input#otpInput')) return '2fa';
-        if(window.location.href.includes('rntrcdigital.antt.gov.br')) return 'logado';
-        return 'falhou';
+      // Expande accordion de novo
+      await this.page.evaluate(()=>{
+        const items = document.querySelectorAll('.item-login-signup-ways');
+        if(items[0]) items[0].click();
+        setTimeout(()=>{
+          const p = document.getElementById('accordion-panel-id');
+          if(p) { p.style.maxHeight = p.scrollHeight+'px'; p.style.overflow='visible'; }
+        }, 500);
       });
+      await this.delay(2000);
+
+      // Digita CPF de novo
+      await this.page.evaluate(()=>{ const el=document.getElementById('accountId'); if(el){el.value='';el.focus();} });
+      await this.delay(300);
+      const cpfRetry = await this.page.$('input#accountId');
+      if(cpfRetry) await this.typeInEl(cpfRetry, cpf, 80);
+      await this.delay(500);
+
+      // Clica continuar de novo (extensão resolve captcha)
+      await this.page.click('button#enter-account-id').catch(()=>{});
+
+      // Aguarda de novo
+      const retry = await this.poll(async()=>{
+        return await this.page.evaluate(()=>{
+          if(document.querySelector('input#password[type="password"]')) return 'senha';
+          if(document.querySelector('input#otpInput')) return '2fa';
+          if(window.location.href.includes('rntrcdigital.antt.gov.br')&&!window.location.href.includes('acesso.gov.br')) return 'logado';
+          return null;
+        });
+      }, 2000, 90000);
 
       if(retry==='senha') { await this.loginSenha(senha); return; }
       if(retry==='2fa') { await this.handle2FA(); await this.verificaLoginFinal(); return; }
