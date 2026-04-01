@@ -1,12 +1,9 @@
-// src/automation/engine.js v2.1 — Correções + Arrendamento avulso + Inclusão avulsa
+// src/automation/engine.js v2.6 — 2captcha via npm + extensão removida
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const RecaptchaPlugin = require('puppeteer-extra-plugin-recaptcha');
 puppeteer.use(StealthPlugin());
-puppeteer.use(RecaptchaPlugin({
-  provider: { id: '2captcha', token: process.env.CAPTCHA_API_KEY || '' },
-  visualFeedback: true
-}));
+const Captcha = require('@2captcha/captcha-solver');
+const solver = new Captcha.Solver(process.env.CAPTCHA_API_KEY || '');
 const path = require('path');
 const fs = require('fs');
 
@@ -107,29 +104,17 @@ class AutomationEngine {
   async initBrowser() {
     this.emit('starting',{message:'Iniciando navegador...'});
     const useDisplay = process.env.DISPLAY || ':99';
-    const extPath = path.join(__dirname, '..', '..', 'extensions', '2captcha-solver');
-    const hasExt = fs.existsSync(extPath);
-
-    const args = [
-      '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-      '--window-size=1366,768','--start-maximized',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      '--display=' + useDisplay
-    ];
-
-    // Carrega extensão 2captcha-solver se existir
-    if(hasExt) {
-      args.push('--disable-extensions-except=' + extPath);
-      args.push('--load-extension=' + extPath);
-      this.emit('starting',{message:'Extensão 2captcha-solver carregada'});
-    }
-
     this.browser = await puppeteer.launch({
       headless: false,
       executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
-      args
+      args:[
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+        '--window-size=1366,768','--start-maximized',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        '--display=' + useDisplay
+      ]
     });
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
@@ -142,18 +127,6 @@ class AutomationEngine {
     await ctx.overridePermissions('https://sso.acesso.gov.br', []);
     const c = await this.page.createCDPSession();
     await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
-
-    // Fecha abas extras que a extensão pode abrir
-    if(hasExt) {
-      await this.delay(2000);
-      const allPages = await this.browser.pages();
-      for(const p of allPages) {
-        const url = p.url();
-        if(url.includes('chrome-extension://') || url === 'about:blank') {
-          if(p !== this.page) await p.close().catch(()=>{});
-        }
-      }
-    }
   }
 
   // ═══ FLUXO PRINCIPAL ═══
@@ -297,18 +270,83 @@ class AutomationEngine {
     });
     this.emit('step',{message:'CPF digitado: '+cpfDigitado.substring(0,3)+'***'});
 
-    // ── ETAPA 4: Clica Continuar ──
-    // A extensão 2captcha-solver resolve o captcha automaticamente em background
-    // Quando o hCaptcha aparece, a extensão detecta, envia pro 2captcha, e preenche sozinha
-    this.emit('step',{message:'Clicando Continuar (captcha será resolvido automaticamente)...'});
+    // ── ETAPA 4: Resolve hCaptcha via 2captcha API ──
+    this.emit('step',{message:'Resolvendo hCaptcha via 2captcha...'});
 
-    // Clica no botão continuar — isso dispara o hCaptcha
-    await this.page.click('button#enter-account-id').catch(()=>{});
+    try {
+      // Extrai o sitekey do hCaptcha da página
+      const sitekey = await this.page.evaluate(()=>{
+        // Procura no iframe do hcaptcha
+        const iframe = document.querySelector('iframe[src*="hcaptcha"]');
+        if(iframe) {
+          const src = iframe.getAttribute('src') || '';
+          const m = src.match(/sitekey=([a-f0-9-]+)/);
+          if(m) return m[1];
+        }
+        // Procura no div do hcaptcha
+        const div = document.querySelector('[data-sitekey]');
+        if(div) return div.getAttribute('data-sitekey');
+        // Procura no script
+        const scripts = document.querySelectorAll('script');
+        for(const s of scripts) {
+          const t = s.textContent || '';
+          const m = t.match(/sitekey:\s*["']([a-f0-9-]+)["']/);
+          if(m) return m[1];
+        }
+        return null;
+      });
 
-    // ── ETAPA 5: Aguarda extensão resolver captcha + navegação ──
-    // A extensão precisa de 15-60 segundos pra resolver
-    // Poll até sair da tela de CPF ou detectar erro
-    this.emit('step',{message:'Aguardando resolução do captcha (pode levar até 60s)...'});
+      if(sitekey) {
+        this.emit('step',{message:'Sitekey encontrado: '+sitekey.substring(0,8)+'... Enviando pro 2captcha...'});
+
+        // Resolve via API do 2captcha
+        const result = await solver.hcaptcha({
+          sitekey: sitekey,
+          pageurl: this.page.url()
+        });
+
+        if(result && result.data) {
+          this.emit('step',{message:'Token recebido! Injetando na página...'});
+
+          // Injeta o token na página
+          await this.page.evaluate((token)=>{
+            // Preenche o campo de resposta do hCaptcha
+            const textarea = document.querySelector('[name="h-captcha-response"], textarea[name*="captcha-response"]');
+            if(textarea) textarea.value = token;
+            // Também tenta via hcaptcha API global
+            if(window.hcaptcha) {
+              // Chama o callback do hCaptcha com o token
+              const cb = window.onHcaptchaCallback || window.hcaptchaCallback;
+              if(typeof cb === 'function') cb(token);
+            }
+          }, result.data);
+
+          await this.delay(1000);
+
+          // Agora submete o formulário
+          this.emit('step',{message:'Captcha resolvido! Submetendo...'});
+          await this.page.evaluate(()=>{
+            const form = document.getElementById('loginData');
+            if(form) form.submit();
+          });
+          await this.delay(5000);
+        } else {
+          this.emit('step',{message:'2captcha nao retornou token'});
+        }
+      } else {
+        // hCaptcha invisível pode não ter sitekey visível — tenta clicar direto
+        this.emit('step',{message:'Sitekey nao encontrado, clicando continuar direto...'});
+        await this.page.click('button#enter-account-id').catch(()=>{});
+        await this.delay(5000);
+      }
+    } catch(e) {
+      this.emit('step',{message:'2captcha erro: '+e.message+'. Clicando continuar...'});
+      await this.page.click('button#enter-account-id').catch(()=>{});
+      await this.delay(5000);
+    }
+
+    // ── ETAPA 5: Detecta resultado ──
+    this.emit('step',{message:'Verificando resultado...'});
 
     const screen = await this.poll(async()=>{
       return await this.page.evaluate(()=>{

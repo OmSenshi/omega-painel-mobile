@@ -12,7 +12,7 @@
     "puppeteer": "^23.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "puppeteer-extra-plugin-recaptcha": "^3.6.8",
+    "@2captcha/captcha-solver": "^1.4.0",
     "whatsapp-web.js": "^1.26.0",
     "qrcode-terminal": "^0.12.0",
     "multer": "^1.4.5-lts.1",
