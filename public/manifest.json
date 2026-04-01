@@ -1,0 +1,16 @@
+{
+  "name": "Omega Painel ANTT",
+  "short_name": "Omega",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#534AB7",
+  "theme_color": "#534AB7",
+  "description": "Automação de cadastro ANTT via mobile",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23534AB7'/><text x='50' y='65' font-size='50' font-weight='bold' fill='white' text-anchor='middle' font-family='sans-serif'>Ω</text></svg>",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
