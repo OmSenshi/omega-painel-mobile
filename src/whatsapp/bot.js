@@ -84,11 +84,20 @@ client.on('disconnected', (reason) => {
 });
 
 // ═══ Listener de mensagens ═══
-client.on('message', async (msg) => {
+// message_create lê TODAS as mensagens (incluindo as do próprio número)
+client.on('message_create', async (msg) => {
   if (!botReady || !targetGroupId) return;
 
   // Só processa mensagens do grupo Omega Bot
-  if (msg.from !== targetGroupId) return;
+  // message_create usa msg.from pra mensagens de outros e msg.to pro grupo
+  const chatId = msg.fromMe ? msg.to : msg.from;
+  if (chatId !== targetGroupId) return;
+
+  // TRAVA ANTI-LOOP: ignora mensagens enviadas pelo proprio bot
+  // O bot responde com reply(), que gera mensagens fromMe
+  // Só processa fromMe se tiver mídia (documento enviado pelo número corporativo)
+  // Ignora textos fromMe pra evitar loop
+  if (msg.fromMe && !msg.hasMedia) return;
 
   try {
     // ── Documento recebido (PDF ou imagem) ──
