@@ -16,7 +16,7 @@ router.post('/start', async (req, res) => {
   const broadcast = req.app.get('broadcast');
 
   try {
-    activeEngine = new AutomationEngine(broadcast);
+    activeEngine = new AutomationEngine(broadcast, req.app.get('whatsappBot'));
     res.json({ success: true, message: 'Automação iniciada' });
 
     // Roda em background (não bloqueia a resposta)

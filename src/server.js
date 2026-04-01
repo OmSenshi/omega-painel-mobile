@@ -9,6 +9,14 @@ const cors = require('cors');
 const automationRoutes = require('./routes/automation');
 const extractionRoutes = require('./routes/extraction');
 
+// WhatsApp Bot (inicia junto com o servidor)
+let whatsappBot = null;
+try {
+  whatsappBot = require('./whatsapp/bot');
+} catch(e) {
+  console.log('  WhatsApp Bot: modulo nao encontrado ou dependencias faltando. Rode npm install.');
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -127,7 +135,17 @@ app.get('*', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n  Omega Painel Mobile v2.1`);
+  console.log(`\n  Omega Painel Mobile v2.4`);
   console.log(`  Rodando em http://0.0.0.0:${PORT}`);
   console.log(`  Acesse do celular/tablet pelo IP da VPS\n`);
+
+  // Inicia WhatsApp Bot
+  if (whatsappBot && process.env.WHATSAPP_GROUP_NAME) {
+    whatsappBot.startBot();
+  } else {
+    console.log('  WhatsApp Bot: desativado (configure WHATSAPP_GROUP_NAME no .env)\n');
+  }
 });
+
+// Disponibiliza bot pra módulos de automação
+app.set('whatsappBot', whatsappBot);

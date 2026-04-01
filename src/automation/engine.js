@@ -16,8 +16,9 @@ const DOWNLOAD_DIR = path.join(__dirname, '..', '..', 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 class AutomationEngine {
-  constructor(broadcast) {
+  constructor(broadcast, whatsappBot) {
     this.broadcast = broadcast;
+    this.wpp = whatsappBot; // referencia ao bot WhatsApp
     this.browser = null;
     this.page = null;
     this.status = 'idle';
@@ -28,7 +29,20 @@ class AutomationEngine {
     this._fixData = null;
   }
 
-  emit(event, data={}) { this.broadcast({ event, step:this.currentStep, ...data }); }
+  emit(event, data={}) {
+    this.broadcast({ event, step:this.currentStep, ...data });
+    // Notifica via WhatsApp nos eventos importantes
+    if(this.wpp) {
+      if(event==='error'||event==='error_critical') {
+        this.wpp.sendError(data.message||'Erro desconhecido', this.currentStep).catch(()=>{});
+      }
+      if(event==='done') {
+        this.wpp.sendToGroup('✅ '+( data.message||'Concluido!')).catch(()=>{});
+        // Envia PDFs automaticamente
+        this.wpp.sendDocuments().catch(()=>{});
+      }
+    }
+  }
   async delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   async typeSlowly(selector, text, delayMs=80) {
@@ -91,7 +105,7 @@ class AutomationEngine {
   }
 
   async initBrowser() {
-    this.emit('starting',{message:'Iniciando navegador...'});
+    this.emit('starting',{message:'Iniciando navegador (incognito)...'});
     const useDisplay = process.env.DISPLAY || ':99';
     this.browser = await puppeteer.launch({
       headless: false,
@@ -99,17 +113,22 @@ class AutomationEngine {
       args:[
         '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
         '--window-size=1366,768','--start-maximized',
+        '--incognito',
         '--disable-blink-features=AutomationControlled',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         '--display=' + useDisplay
       ]
     });
-    this.page = await this.browser.newPage();
+    // Usa contexto incognito
+    const ctx = await this.browser.createBrowserContext();
+    this.page = await ctx.newPage();
     await this.page.evaluateOnNewDocument(()=>{
       Object.defineProperty(navigator,'webdriver',{get:()=>false});
       window.chrome={runtime:{}};
     });
     await this.page.setViewport({width:1366,height:768});
+    // Nega permissão de localização
+    await ctx.overridePermissions('https://sso.acesso.gov.br', []);
     const c = await this.page.createCDPSession();
     await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
   }
@@ -136,102 +155,191 @@ class AutomationEngine {
     } finally { await this.cleanup(); }
   }
 
-  // ═══ LOGIN AUTOMATICO (2captcha) + FALLBACK noVNC ═══
+  // ═══ LOGIN: accordion + 2captcha + 2FA + fallback noVNC ═══
   async stepLogin(tipo,cred) {
     this.currentStep='login';
-    this.emit('step',{message:'Fazendo login...'});
-
-    // Nega permissão de localização
-    const ctx = this.browser.defaultBrowserContext();
-    await ctx.overridePermissions('https://sso.acesso.gov.br', []);
+    this.emit('step',{message:'Abrindo portal...'});
 
     await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
+    await this.delay(2000);
 
     let cpf,senha;
     if(tipo==='cnpj'){cpf=process.env.COLAB_CPF||cred.cpf;senha=process.env.COLAB_SENHA||cred.senha;}
     else{cpf=(cred.cpf||'').replace(/\D/g,'');senha=cred.senha||'';}
 
-    // Campo CPF = #accountId
+    // Aguarda pagina gov.br carregar
     if(!await this.waitFor('#accountId',20000)){
-      const a=await this.pauseForError('Campo CPF nao encontrado. Verifique pelo noVNC.','cpf',cpf);
+      const a=await this.pauseForError('Pagina gov.br nao carregou. Verifique pelo noVNC.','cpf',cpf);
       if(a==='stop')return;
     }
 
-    // Abre accordion
-    await this.page.evaluate(()=>{const p=document.getElementById('accordion-panel-id');if(p&&!p.style.maxHeight){const b=document.querySelector('[onclick*="accordion"]');if(b)b.click();}});
+    // CORREÇÃO: Clica em "Número do CPF" pra EXPANDIR o accordion
+    this.emit('step',{message:'Expandindo campo de CPF...'});
+    await this.page.evaluate(()=>{
+      // O primeiro .item-login-signup-ways é "Número do CPF"
+      const items = document.querySelectorAll('.item-login-signup-ways');
+      if(items.length > 0) items[0].click();
+    });
+    await this.delay(1000);
+
+    // Garante que o accordion abriu
+    await this.page.evaluate(()=>{
+      const p = document.getElementById('accordion-panel-id');
+      if(p && !p.style.maxHeight) p.style.maxHeight = p.scrollHeight + 'px';
+    });
     await this.delay(500);
 
-    // Digita CPF
+    // Foca e digita CPF
+    this.emit('step',{message:'Digitando CPF...'});
+    await this.page.focus('#accountId');
+    await this.delay(300);
     await this.typeSlowly('#accountId',cpf,100);
-    this.emit('step',{message:'CPF digitado, resolvendo captcha...'});
 
-    // Resolve hCaptcha via 2captcha
+    // Tenta resolver hCaptcha via 2captcha
+    this.emit('step',{message:'Resolvendo captcha...'});
     try {
-      const {solved}=await this.page.solveRecaptchas();
-      if(solved&&solved.length>0) this.emit('step',{message:'hCaptcha resolvido!'});
+      const result = await this.page.solveRecaptchas();
+      if(result.solved && result.solved.length > 0) {
+        this.emit('step',{message:'Captcha resolvido!'});
+      }
     } catch(e) {
-      this.emit('step',{message:'2captcha: '+e.message+'. Tentando sem...'});
+      this.emit('step',{message:'2captcha: '+e.message});
     }
 
     // Clica continuar
+    this.emit('step',{message:'Clicando continuar...'});
     try {
       await Promise.all([
         this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
         this.page.click('#enter-account-id')
       ]);
     } catch(e) {
-      this.emit('step',{message:'Aguardando redirect...'});
       await this.delay(5000);
     }
 
-    // Verifica tela de senha
-    const senhaOk=await this.poll(async()=>await this.page.evaluate(()=>!!document.querySelector('#password')),1000,20000);
+    // Detecta em qual tela estamos: senha, 2FA, ou erro
+    await this.delay(2000);
+    const screen = await this.page.evaluate(()=>{
+      if(document.querySelector('#password')) return 'senha';
+      if(document.querySelector('#otpInput')) return '2fa';
+      if(document.querySelector('#accountId')) return 'cpf'; // ainda na tela de CPF
+      const url = window.location.href;
+      if(url.includes('rntrcdigital.antt.gov.br')) return 'logado';
+      return 'desconhecido';
+    });
 
-    if(!senhaOk) {
-      // Fallback noVNC
+    if(screen === 'cpf') {
+      // Captcha bloqueou — fallback noVNC
       const a=await this.pauseForError(
-        'Captcha pode ter bloqueado. Faca login pelo noVNC e clique Corrigir, ou clique Parar.',
+        'Captcha bloqueou. Faca login pelo noVNC e clique Corrigir quando estiver logado.',
         'login_novnc','Aguardando...'
       );
       if(a==='stop')return;
-      // Verifica se logou via noVNC
+      // Verifica se logou
+      await this.delay(1000);
       const u=this.page.url();
       if(u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br')){
         this.checkpoint.login=true;
         this.emit('step_done',{message:'Login confirmado (noVNC)',step:'login'});
         return;
       }
-      // Se esta na tela de senha agora, continua
-      if(!await this.page.$('#password')){
-        this.checkpoint.login=true;
-        this.emit('step_done',{message:'Login confirmado',step:'login'});
-        return;
+      // Tenta continuar se esta em outra tela agora
+    }
+
+    if(screen === 'logado') {
+      this.checkpoint.login=true;
+      this.emit('step_done',{message:'Login realizado',step:'login'});
+      return;
+    }
+
+    // ── TELA DE SENHA ──
+    if(screen === 'senha' || await this.page.$('#password')) {
+      this.emit('step',{message:'Digitando senha...'});
+      await this.delay(1000);
+      await this.typeSlowly('#password',senha,60);
+      await this.delay(500);
+
+      try {
+        await Promise.all([
+          this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+          this.page.click('#submit-button')
+        ]);
+      } catch(e) { await this.delay(3000); }
+
+      // Depois da senha, pode aparecer 2FA
+      await this.delay(2000);
+      const post = await this.page.evaluate(()=>{
+        if(document.querySelector('#otpInput')) return '2fa';
+        if(window.location.href.includes('rntrcdigital.antt.gov.br')) return 'logado';
+        return 'outro';
+      });
+
+      if(post === '2fa') {
+        await this.handle2FA();
+      } else if(post !== 'logado') {
+        const a=await this.pauseForError('Tela inesperada apos senha. Verifique pelo noVNC.','login_novnc','');
+        if(a==='stop')return;
       }
     }
 
-    // Preenche senha
-    this.emit('step',{message:'Digitando senha...'});
-    await this.delay(1000);
-    await this.typeSlowly('#password',senha,60);
-    await this.delay(500);
+    // ── TELA 2FA (direta, sem tela de senha antes) ──
+    if(screen === '2fa') {
+      await this.handle2FA();
+    }
 
-    // Clica entrar
-    try {
-      await Promise.all([
-        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
-        this.page.click('#submit-button')
-      ]);
-    } catch(e) { await this.delay(3000); }
-
-    // Verifica login
-    const ok=await this.poll(async()=>{const u=this.page.url();return u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br');},1000,20000);
-    if(!ok){
-      const a=await this.pauseForError('Login pode ter falhado. Verifique pelo noVNC.','login_novnc','');
+    // Verifica login final
+    await this.delay(2000);
+    const finalUrl = this.page.url();
+    if(!finalUrl.includes('rntrcdigital.antt.gov.br') || finalUrl.includes('acesso.gov.br')) {
+      const a=await this.pauseForError('Login nao confirmado. Verifique pelo noVNC.','login_novnc','');
       if(a==='stop')return;
     }
 
     this.checkpoint.login=true;
     this.emit('step_done',{message:'Login realizado',step:'login'});
+  }
+
+  // ── VERIFICAÇÃO EM DUAS ETAPAS ──
+  async handle2FA() {
+    this.currentStep='2fa';
+    this.emit('step',{message:'Codigo de acesso habilitado.'});
+
+    // Pausa pra usuario digitar o codigo do app gov.br
+    const action = await this.pauseForError(
+      'Verificacao em duas etapas. Digite o codigo do app gov.br no campo abaixo.',
+      'codigo_2fa',
+      ''
+    );
+    if(action === 'stop') return;
+
+    // Pega o codigo que o usuario digitou no painel
+    const code = this._fixData ? this._fixData.value : '';
+    if(code && code.length === 6) {
+      // Digita o codigo no campo
+      await this.typeSlowly('#otpInput', code, 50);
+      await this.delay(300);
+
+      // Marca "nao solicitar novamente"
+      await this.page.evaluate(()=>{
+        const cb = document.getElementById('device');
+        if(cb && !cb.checked) cb.click();
+      });
+      await this.delay(300);
+
+      // Clica Ok
+      try {
+        await Promise.all([
+          this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
+          this.page.click('#enter-offline-2fa-code')
+        ]);
+      } catch(e) { await this.delay(3000); }
+
+      this.emit('step',{message:'Codigo enviado, aguardando...'});
+    } else {
+      // Codigo invalido ou vazio — usuario pode ter feito pelo noVNC
+      this.emit('step',{message:'Aguardando confirmacao...'});
+      await this.delay(3000);
+    }
   }
 
   // ═══ CONTRATO — seletores reais do HTML ═══
