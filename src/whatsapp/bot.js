@@ -84,20 +84,28 @@ client.on('disconnected', (reason) => {
 });
 
 // ═══ Listener de mensagens ═══
-// message_create lê TODAS as mensagens (incluindo as do próprio número)
 client.on('message_create', async (msg) => {
   if (!botReady || !targetGroupId) return;
 
-  // Só processa mensagens do grupo Omega Bot
-  // message_create usa msg.from pra mensagens de outros e msg.to pro grupo
+  // Identifica o grupo corretamente
   const chatId = msg.fromMe ? msg.to : msg.from;
   if (chatId !== targetGroupId) return;
 
-  // TRAVA ANTI-LOOP: ignora mensagens enviadas pelo proprio bot
-  // O bot responde com reply(), que gera mensagens fromMe
-  // Só processa fromMe se tiver mídia (documento enviado pelo número corporativo)
-  // Ignora textos fromMe pra evitar loop
-  if (msg.fromMe && !msg.hasMedia) return;
+  // ANTI-LOOP: ignora mensagens que o BOT enviou como resposta
+  // Detecta pelas marcas das respostas automáticas (emojis/prefixos)
+  if (msg.fromMe) {
+    const body = (msg.body || '').trim();
+    // Se é resposta do bot (começa com emoji ou * de formatação), ignora
+    if (body.startsWith('🔍') || body.startsWith('✅') || body.startsWith('❌') ||
+        body.startsWith('⚠️') || body.startsWith('📊') || body.startsWith('📄') ||
+        body.startsWith('🪪') || body.startsWith('🏠') || body.startsWith('🏢') ||
+        body.startsWith('🚗') || body.startsWith('👤') || body.startsWith('📝') ||
+        body.startsWith('*Omega Bot')) {
+      return; // é resposta do bot, ignora
+    }
+    // Se fromMe + texto puro que não é resposta do bot = mensagem do usuario corporativo
+    // Continua processando normalmente
+  }
 
   try {
     // ── Documento recebido (PDF ou imagem) ──
