@@ -336,3 +336,73 @@ ufw allow 3000
 - Verifique se digitou o IP correto
 - Verifique se o PM2 está rodando: `pm2 status`
 - Veja os logs: `pm2 logs omega-painel`
+
+---
+
+## Passo 9: Configurar noVNC (login visual)
+
+O portal gov.br tem hCaptcha que bloqueia automação. Por isso, o login é
+semi-manual: o Puppeteer abre o Chrome com tela visível, e você faz login
+pelo navegador do celular via noVNC.
+
+### Instalar noVNC
+
+```bash
+cd /opt/omega-painel
+sudo bash scripts/setup-novnc.sh
+```
+
+Esse script instala tudo automaticamente:
+- **Xvfb**: tela virtual (o Chrome "desenha" nela mesmo sem monitor)
+- **x11vnc**: servidor VNC que captura a tela virtual
+- **noVNC**: converte VNC pra WebSocket (acessa pelo navegador, sem app)
+
+### Como usar
+
+1. No painel Omega, clique "Iniciar cadastro"
+2. O status vai mostrar: "Faca login pelo noVNC"
+3. No celular, abra outra aba: `http://SEU_IP:6080/vnc.html`
+4. Você verá o Chrome aberto na tela de login do gov.br
+5. Faça login normalmente (CPF, senha, captcha se pedir)
+6. Quando estiver na página inicial do RNTRC, volte pro painel
+7. Clique "Corrigir e retentar" — a automação assume dali
+
+### Verificar se está rodando
+
+```bash
+systemctl status xvfb x11vnc novnc
+```
+
+### Se a tela do noVNC estiver preta
+
+```bash
+# Reinicia os serviços
+systemctl restart xvfb x11vnc novnc
+
+# Verifica logs
+journalctl -u xvfb -n 20
+journalctl -u x11vnc -n 20
+```
+
+### Segurança (opcional mas recomendado)
+
+O noVNC padrão não tem senha. Para adicionar:
+
+```bash
+x11vnc -storepasswd SUA_SENHA /etc/x11vnc.pass
+```
+
+Depois edite o serviço:
+```bash
+nano /etc/systemd/system/x11vnc.service
+```
+
+Troque a linha ExecStart por:
+```
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbport 5900 -rfbauth /etc/x11vnc.pass
+```
+
+```bash
+systemctl daemon-reload
+systemctl restart x11vnc
+```

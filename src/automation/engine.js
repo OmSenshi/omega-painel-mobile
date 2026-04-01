@@ -87,21 +87,22 @@ class AutomationEngine {
 
   async initBrowser() {
     this.emit('starting',{message:'Iniciando navegador...'});
+    const useDisplay = process.env.DISPLAY || ':99';
     this.browser = await puppeteer.launch({
-      headless:'new',
+      headless: false,
       executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
       args:[
-        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--window-size=1366,768',
+        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
+        '--window-size=1366,768','--start-maximized',
         '--disable-blink-features=AutomationControlled',
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        '--display=' + useDisplay
       ]
     });
     this.page = await this.browser.newPage();
-    // Anti-deteccao: remove webdriver flag
     await this.page.evaluateOnNewDocument(()=>{
       Object.defineProperty(navigator,'webdriver',{get:()=>false});
       window.chrome={runtime:{}};
-      window.navigator.permissions={query:p=>Promise.resolve({state:'granted'})};
     });
     await this.page.setViewport({width:1366,height:768});
     const c = await this.page.createCDPSession();
@@ -130,67 +131,59 @@ class AutomationEngine {
     } finally { await this.cleanup(); }
   }
 
-  // ═══ LOGIN ═══
+  // ═══ LOGIN SEMI-MANUAL via noVNC ═══
   async stepLogin(tipo,cred) {
-    this.currentStep='login'; this.emit('step',{message:'Fazendo login...'});
+    this.currentStep='login';
+    const vncPort = process.env.VNC_PORT || '6080';
+
     await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
-    let cpf,senha;
-    if(tipo==='cnpj'){cpf=process.env.COLAB_CPF||cred.cpf;senha=process.env.COLAB_SENHA||cred.senha;}
-    else{cpf=(cred.cpf||'').replace(/\D/g,'');senha=cred.senha||'';}
-    // gov.br SSO: campo CPF = #accountId, botao = #enter-account-id
-    if(!await this.waitFor('#accountId',20000)){const a=await this.pauseForError('Campo CPF nao encontrado (gov.br)','cpf',cpf);if(a==='stop')return;}
-    // Abre accordion do CPF se necessario
-    await this.page.evaluate(()=>{const p=document.getElementById('accordion-panel-id');if(p&&!p.style.maxHeight)document.querySelector('[onclick*="accordion"]')?.click();});
-    await this.delay(500);
-    await this.typeSlowly('#accountId',cpf,100);
-    this.emit('step',{message:'CPF digitado, clicando continuar...'});
-    // Submete — hCaptcha invisivel vai processar automaticamente
-    // Submete via click — hCaptcha invisivel processa em background
-    // Usa waitForNavigation pra aguardar redirect real
-    try {
-      await Promise.all([
-        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
-        this.page.click('#enter-account-id')
-      ]);
-    } catch(e) {
-      // Se timeout, pode ser hCaptcha bloqueando — tenta aguardar mais
-      this.emit('step',{message:'Aguardando hCaptcha...'});
-      await this.delay(5000);
-      // Verifica se a pagina mudou
-      const stillCpf = await this.page.$('#accountId');
-      if(stillCpf) {
-        // Ainda na tela de CPF — hCaptcha pode ter bloqueado
-        // Tenta submeter o form diretamente
-        await this.page.evaluate(()=>{
-          document.getElementById('loginData').submit();
-        });
-        await this.delay(5000);
-      }
+
+    this.emit('step',{message:'Portal aberto no noVNC. Faca login manualmente.'});
+
+    // Pausa com instrucoes — enquanto espera, faz polling pra detectar login automaticamente
+    let loggedIn = false;
+
+    // Inicia polling em background
+    const pollInterval = setInterval(async () => {
+      try {
+        const url = this.page.url();
+        // Se saiu do gov.br e esta no portal ANTT = logou
+        if (url.includes('rntrcdigital.antt.gov.br') && !url.includes('acesso.gov.br')) {
+          loggedIn = true;
+          // Se ainda esta pausado, resume automaticamente
+          if (this._pauseResolve) {
+            this._pauseResolve('fix');
+            this._pauseResolve = null;
+          }
+        }
+      } catch {}
+    }, 2000);
+
+    if (!loggedIn) {
+      const action = await this.pauseForError(
+        'Acesse o noVNC (porta ' + vncPort + ') e faca login no gov.br. O sistema detecta automaticamente quando voce logar, ou clique "Corrigir" quando terminar.',
+        'login_novnc',
+        'Aguardando...'
+      );
+      if (action === 'stop') { clearInterval(pollInterval); return; }
     }
-    // Tela de senha: campo = #password, botao = #submit-button
-    // Aguarda com timeout generoso (hCaptcha pode demorar)
-    const senhaOk = await this.poll(async()=>{
-      return await this.page.evaluate(()=>!!document.querySelector('#password'));
-    },1000,30000);
-    if(!senhaOk){const a=await this.pauseForError('Tela de senha nao carregou — hCaptcha pode ter bloqueado. Tente novamente.','senha','');if(a==='stop')return;}
-    this.emit('step',{message:'Tela de senha carregou, digitando...'});
-    await this.delay(1000);
-    await this.typeSlowly('#password',senha,60);
-    await this.delay(500);
-    // Submit senha — nao tem hCaptcha na tela de senha
-    try {
-      await Promise.all([
-        this.page.waitForNavigation({waitUntil:'networkidle2',timeout:30000}),
-        this.page.click('#submit-button')
-      ]);
-    } catch(e) {
-      await this.delay(3000);
+
+    clearInterval(pollInterval);
+
+    // Verifica mais uma vez
+    await this.delay(2000);
+    const url = this.page.url();
+    if (url.includes('acesso.gov.br') || url.includes('login')) {
+      const retry = await this.pauseForError(
+        'Login ainda nao detectado. URL atual: ' + url.substring(0,60) + '... Termine o login e clique "Corrigir".',
+        'login_novnc',
+        url
+      );
+      if (retry === 'stop') return;
     }
-    // Verifica se login foi bem sucedido (sai do sso.acesso.gov.br)
-    const ok=await this.poll(async()=>{const u=this.page.url();return u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br');},1000,30000);
-    if(!ok){const a=await this.pauseForError('Login falhou — verifique CPF e senha','senha','');if(a==='stop')return;}
-    this.checkpoint.login=true;
-    this.emit('step_done',{message:'Login realizado',step:'login'});
+
+    this.checkpoint.login = true;
+    this.emit('step_done',{message:'Login confirmado',step:'login'});
   }
 
   // ═══ CONTRATO — seletores reais do HTML ═══
