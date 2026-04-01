@@ -12,7 +12,7 @@ router.post('/start', async (req, res) => {
     return res.status(409).json({ error: 'Já existe uma automação em andamento' });
   }
 
-  const { tipo, credenciais, transportador, veiculos, cnpj_data } = req.body;
+  const { modo, tipo, credenciais, transportador, veiculos, cnpj_data, arrendamento } = req.body;
   const broadcast = req.app.get('broadcast');
 
   try {
@@ -20,7 +20,7 @@ router.post('/start', async (req, res) => {
     res.json({ success: true, message: 'Automação iniciada' });
 
     // Roda em background (não bloqueia a resposta)
-    activeEngine.run({ tipo, credenciais, transportador, veiculos, cnpj_data })
+    activeEngine.run({ modo, tipo, credenciais, transportador, veiculos, cnpj_data, arrendamento })
       .catch(err => {
         broadcast({
           event: 'error_critical',

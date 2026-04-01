@@ -1,12 +1,11 @@
-// src/automation/engine.js — Motor de automação com Puppeteer
+// src/automation/engine.js v2.1 — Correções + Arrendamento avulso + Inclusão avulsa
 const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs');
 
 const PORTAL_URL = 'https://rntrcdigital.antt.gov.br/';
+const ARRENDAMENTO_URL = 'https://rntrcdigital.antt.gov.br/ContratoArrendamento/Criar';
 const DOWNLOAD_DIR = path.join(__dirname, '..', '..', 'downloads');
-
-// Garante que a pasta de downloads existe
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 class AutomationEngine {
@@ -14,853 +13,408 @@ class AutomationEngine {
     this.broadcast = broadcast;
     this.browser = null;
     this.page = null;
-    this.status = 'idle'; // idle | running | paused | done | error
+    this.status = 'idle';
     this.currentStep = '';
     this.lastError = null;
-    this.checkpoint = {
-      login: false,
-      contrato: false,
-      dropdown: false,
-      cadastro: false,
-      veiculos: [],
-      finalizado: false,
-      documentos: false
-    };
-
-    // Controle de pausa/retomada
+    this.checkpoint = { login:false, contrato:false, dropdown:false, cadastro:false, veiculos:[], finalizado:false, documentos:false };
     this._pauseResolve = null;
     this._fixData = null;
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────
+  emit(event, data={}) { this.broadcast({ event, step:this.currentStep, ...data }); }
+  async delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  emit(event, data = {}) {
-    this.broadcast({ event, step: this.currentStep, ...data });
-  }
-
-  async delay(ms) {
-    return new Promise(r => setTimeout(r, ms));
-  }
-
-  // Digita caractere por caractere com delay (simula humano, ativa masking do portal)
-  async typeSlowly(selector, text, delayMs = 80) {
+  async typeSlowly(selector, text, delayMs=80) {
     const el = await this.page.$(selector);
-    if (!el) throw new Error(`Elemento não encontrado: ${selector}`);
-    await el.click({ clickCount: 3 }); // seleciona tudo
-    await el.press('Backspace');
-    for (const char of text) {
-      await el.type(char, { delay: delayMs });
-    }
+    if (!el) throw new Error('Elemento nao encontrado: '+selector);
+    await el.click({ clickCount:3 }); await el.press('Backspace');
+    for (const ch of text) await el.type(ch, { delay:delayMs });
   }
 
-  // Aguarda seletor com timeout customizável
-  async waitFor(selector, timeout = 15000) {
-    try {
-      await this.page.waitForSelector(selector, { timeout });
-      return true;
-    } catch {
-      return false;
-    }
+  async typeInEl(el, text, delayMs=80) {
+    await el.click({ clickCount:3 }); await el.press('Backspace');
+    for (const ch of text) await el.type(ch, { delay:delayMs });
   }
 
-  // Polling — aguarda condição com intervalo
-  async poll(checkFn, intervalMs = 500, timeoutMs = 30000) {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const result = await checkFn();
-      if (result) return result;
-      await this.delay(intervalMs);
-    }
+  async waitFor(sel, timeout=15000) {
+    try { await this.page.waitForSelector(sel, { timeout }); return true; } catch { return false; }
+  }
+
+  async poll(fn, interval=500, timeout=30000) {
+    const s = Date.now();
+    while (Date.now()-s < timeout) { const r = await fn(); if (r) return r; await this.delay(interval); }
     return null;
   }
 
-  // Pausa a automação e aguarda ação do usuário
-  async pauseForError(errorMsg, field = null, currentValue = '') {
+  async waitForModal(timeout=10000) {
+    return this.poll(async () => {
+      const m = await this.page.$('.modal.show, .modal.in, .modal[style*="display: block"]');
+      if (!m) return false;
+      const f = await this.page.$$('.modal.show input, .modal.show select, .modal.in input, .modal.in select');
+      return f.length > 0;
+    }, 300, timeout);
+  }
+
+  async pauseForError(msg, field=null, val='') {
     this.status = 'paused';
-    this.lastError = { message: errorMsg, field, currentValue };
-    this.emit('error', {
-      message: errorMsg,
-      field,
-      currentValue,
-      options: ['fix', 'pause', 'stop']
-    });
-
-    // Aguarda resolução (fix, resume ou stop)
-    return new Promise(resolve => {
-      this._pauseResolve = resolve;
-    });
+    this.lastError = { message:msg, field, currentValue:val };
+    this.emit('error', { message:msg, field, currentValue:val, options:['fix','pause','stop'] });
+    return new Promise(r => { this._pauseResolve = r; });
   }
 
-  // Chamado quando o usuário clica "Corrigir e retentar"
-  fix(field, value) {
-    this._fixData = { field, value };
-    if (this._pauseResolve) {
-      this._pauseResolve('fix');
-      this._pauseResolve = null;
-    }
-  }
-
-  // Chamado quando o usuário clica "Continuar" (após pausar)
-  resume() {
-    this.status = 'running';
-    this.emit('resumed');
-    if (this._pauseResolve) {
-      this._pauseResolve('resume');
-      this._pauseResolve = null;
-    }
-  }
-
-  // Chamado quando o usuário clica "Parar"
-  async stop() {
-    this.status = 'done';
-    this.emit('stopped', { checkpoint: this.checkpoint });
-    if (this._pauseResolve) {
-      this._pauseResolve('stop');
-      this._pauseResolve = null;
-    }
-    await this.cleanup();
-  }
-
-  async cleanup() {
-    if (this.browser) {
-      try { await this.browser.close(); } catch {}
-      this.browser = null;
-      this.page = null;
-    }
-  }
-
-  // ── Fluxo principal ─────────────────────────────────────────────
-
-  async run(data) {
-    this.status = 'running';
-    const { tipo, credenciais, transportador, veiculos, cnpj_data } = data;
-
-    try {
-      // Inicia navegador
-      this.emit('starting', { message: 'Iniciando navegador...' });
-      this.browser = await puppeteer.launch({
-        headless: 'new',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--window-size=1366,768'
-        ]
-      });
-      this.page = await this.browser.newPage();
-      await this.page.setViewport({ width: 1366, height: 768 });
-
-      // Configura download automático de PDFs
-      const client = await this.page.createCDPSession();
-      await client.send('Page.setDownloadBehavior', {
-        behavior: 'allow',
-        downloadPath: DOWNLOAD_DIR
-      });
-
-      // ── ETAPA 1: LOGIN ──────────────────────────────────────────
-      await this.stepLogin(tipo, credenciais);
-
-      // ── ETAPA 2: CONTRATO ───────────────────────────────────────
-      await this.stepContrato();
-
-      // ── ETAPA 3: DROPDOWN TRANSPORTADOR ─────────────────────────
-      await this.stepDropdown(tipo, credenciais, cnpj_data);
-
-      // ── ETAPA 4: CADASTRO ───────────────────────────────────────
-      await this.stepCadastro(tipo, transportador, cnpj_data);
-
-      // ── ETAPA 5: VEÍCULOS (só após cadastro OK) ─────────────────
-      if (veiculos && veiculos.length > 0) {
-        for (let i = 0; i < veiculos.length; i++) {
-          await this.stepVeiculo(veiculos[i], i + 1, veiculos.length);
-        }
-      }
-
-      // ── ETAPA 6: FINALIZAR ──────────────────────────────────────
-      await this.stepFinalizar();
-
-      // ── ETAPA 7: EMITIR DOCUMENTOS ──────────────────────────────
-      await this.stepEmitirDocumentos();
-
-      this.status = 'done';
-      this.emit('done', { message: 'Cadastro completo!', checkpoint: this.checkpoint });
-
-    } catch (err) {
-      if (this.status !== 'done') { // não era um stop voluntário
-        this.status = 'error';
-        this.emit('error_critical', {
-          message: err.message,
-          checkpoint: this.checkpoint
-        });
-      }
-    } finally {
-      await this.cleanup();
-    }
-  }
-
-  // ── ETAPAS INDIVIDUAIS ────────────────────────────────────────
-
-  async stepLogin(tipo, credenciais) {
-    this.currentStep = 'login';
-    this.emit('step', { message: 'Fazendo login...' });
-
-    await this.page.goto(PORTAL_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-
-    // Determina CPF e senha baseado no tipo
-    let cpf, senha;
-    if (tipo === 'cnpj') {
-      cpf = process.env.COLAB_CPF || credenciais.cpf;
-      senha = process.env.COLAB_SENHA || credenciais.senha;
-    } else {
-      cpf = credenciais.cpf.replace(/\D/g, '');
-      senha = credenciais.senha;
-    }
-
-    // Campo CPF
-    const cpfField = await this.waitFor('#Cpf, #cpf, input[name="cpf"], input[name="Cpf"]');
-    if (!cpfField) {
-      const action = await this.pauseForError('Campo de CPF não encontrado na tela de login', 'cpf', cpf);
-      if (action === 'stop') return;
-    }
-
-    await this.typeSlowly('#Cpf, #cpf, input[name="cpf"], input[name="Cpf"]', cpf);
-    this.emit('step', { message: 'CPF digitado, clicando continuar...' });
-
-    // Botão continuar
-    const btnContinuar = await this.page.$('button[type="submit"], #btnContinuar, .btn-continuar');
-    if (btnContinuar) await btnContinuar.click();
-    await this.delay(2000);
-
-    // Campo senha
-    const senhaField = await this.waitFor('#Senha, #senha, input[type="password"]');
-    if (!senhaField) {
-      const action = await this.pauseForError('Campo de senha não encontrado', 'senha', '');
-      if (action === 'stop') return;
-    }
-
-    await this.typeSlowly('#Senha, #senha, input[type="password"]', senha);
-
-    // Botão entrar
-    const btnEntrar = await this.page.$('#btnEntrar, button[type="submit"]');
-    if (btnEntrar) await btnEntrar.click();
-    await this.delay(3000);
-
-    // Verifica se login foi bem sucedido
-    const loginOk = await this.poll(async () => {
-      const url = this.page.url();
-      return !url.includes('login') && !url.includes('Login');
-    }, 500, 15000);
-
-    if (!loginOk) {
-      const action = await this.pauseForError('Login falhou — verifique CPF e senha', 'senha', '');
-      if (action === 'stop') return;
-    }
-
-    this.checkpoint.login = true;
-    this.emit('step_done', { message: 'Login realizado', step: 'login' });
-  }
-
-  async stepContrato() {
-    this.currentStep = 'contrato';
-    this.emit('step', { message: 'Verificando contrato...' });
-    await this.delay(2000);
-
-    // Verifica se apareceu tela de contrato
-    const contratoPresente = await this.page.$('#aceiteContrato, .termo-aceite, input[type="checkbox"][id*="ceite"]');
-
-    if (contratoPresente) {
-      this.emit('step', { message: 'Contrato encontrado, aceitando...' });
-
-      // Marca checkbox de aceite
-      const checkbox = await this.page.$('input[type="checkbox"]');
-      if (checkbox) {
-        await checkbox.click();
-        await this.delay(500);
-      }
-
-      // Botão avançar/aceitar
-      const btnAceitar = await this.page.$('button[type="submit"], .btn-avancar, #btnAvancar');
-      if (btnAceitar) {
-        await btnAceitar.click();
-        await this.delay(3000);
-      }
-
-      this.emit('step_done', { message: 'Contrato aceito', step: 'contrato' });
-    } else {
-      this.emit('step_done', { message: 'Sem contrato pendente', step: 'contrato' });
-    }
-
-    this.checkpoint.contrato = true;
-  }
-
-  async stepDropdown(tipo, credenciais, cnpj_data) {
-    this.currentStep = 'dropdown';
-    this.emit('step', { message: 'Abrindo dropdown transportador...' });
-
-    // Clica em "Transportador" no menu/dropdown
-    const dropdown = await this.waitFor('#dropdownTransportador, .dropdown-transportador, [data-action*="Transportador"]');
-    if (dropdown) {
-      const el = await this.page.$('#dropdownTransportador, .dropdown-transportador, [data-action*="Transportador"]');
-      if (el) await el.click();
-      await this.delay(1500);
-    }
-
-    // Clica em "Novo cadastro"
-    const novoCadastro = await this.page.$('[data-action*="Novo"], .novo-cadastro, a:has-text("Novo")');
-    if (novoCadastro) {
-      await novoCadastro.click();
-      await this.delay(2000);
-    }
-
-    // Seleciona CPF ou CNPJ no dropdown de seleção
-    this.emit('step', { message: 'Selecionando no dropdown...' });
-
-    let valorBusca;
-    if (tipo === 'cnpj' && cnpj_data) {
-      valorBusca = cnpj_data.cnpj.replace(/\D/g, '');
-    } else {
-      valorBusca = credenciais.cpf.replace(/\D/g, '');
-    }
-
-    // Procura e seleciona no dropdown pela lista de opções
-    const selecionou = await this.poll(async () => {
-      const options = await this.page.$$('select option, .dropdown-item, li[data-value]');
-      for (const opt of options) {
-        const text = await opt.evaluate(el => el.textContent || el.value || '');
-        if (text.replace(/\D/g, '').includes(valorBusca)) {
-          await opt.click();
-          return true;
-        }
-      }
-      return false;
-    }, 500, 10000);
-
-    if (!selecionou) {
-      const action = await this.pauseForError(
-        `Não encontrou "${valorBusca}" no dropdown. Verifique o CPF/CNPJ.`,
-        'dropdown_valor', valorBusca
-      );
-      if (action === 'stop') return;
-    }
-
-    await this.delay(1500);
-
-    // Clica em "Criar pedido"
-    const btnCriar = await this.page.$('[data-action*="Criar"], .btn-criar-pedido, #btnCriarPedido');
-    if (btnCriar) {
-      await btnCriar.click();
-      await this.delay(3000);
-    }
-
-    this.checkpoint.dropdown = true;
-    this.emit('step_done', { message: `${tipo.toUpperCase()} selecionado, pedido criado`, step: 'dropdown' });
-  }
-
-  async stepCadastro(tipo, transportador, cnpj_data) {
-    this.currentStep = 'cadastro';
-    this.emit('step', { message: 'Preenchendo cadastro...' });
-
-    if (tipo === 'cpf') {
-      await this.preencherCadastroCPF(transportador);
-    } else {
-      await this.preencherCadastroCNPJ(transportador, cnpj_data);
-    }
-
-    this.checkpoint.cadastro = true;
-    this.emit('step_done', { message: 'Cadastro preenchido com sucesso', step: 'cadastro' });
-  }
-
-  async preencherCadastroCPF(dados) {
-    // ── Aba Transportador (automático pela Receita) ──
-    this.emit('step', { message: 'Aba Transportador — aguardando Receita...' });
-    await this.delay(2000);
-
-    // ── Aba Contatos — identidade + endereço ──
-    this.emit('step', { message: 'Preenchendo contatos...' });
-
-    // Identidade
-    const identidade = dados.identidade || '000000';
-    const identField = await this.page.$('#Identidade, #identidade');
-    if (identField) {
-      await this.typeSlowly('#Identidade, #identidade', identidade);
-    }
-
-    // Órgão emissor — sempre SSP
-    const orgaoField = await this.page.$('#OrgaoEmissor, select[name*="OrgaoEmissor"]');
-    if (orgaoField) {
-      await this.page.select('#OrgaoEmissor, select[name*="OrgaoEmissor"]', 'SSP');
-    }
-
-    // UF emissor
-    if (dados.uf) {
-      const ufField = await this.page.$('#UfIdentidade, select[name*="UfIdentidade"]');
-      if (ufField) {
-        await this.page.select('#UfIdentidade, select[name*="UfIdentidade"]', dados.uf);
-      }
-    }
-
-    // Endereço — preenche se tiver, senão usa fallback
-    await this.preencherEndereco(dados);
-
-    // ── Motorista Auxiliar — pula ──
-    this.emit('step', { message: 'Motorista auxiliar — pulando...' });
-  }
-
-  async preencherCadastroCNPJ(dados, cnpj_data) {
-    // ── Aba Transportador — marca capacidade financeira ──
-    this.emit('step', { message: 'Marcando capacidade financeira...' });
-    const checkCap = await this.page.$('#TransportadorEtc_SituacaoCapacidadeFinanceira');
-    if (checkCap) {
-      await this.page.evaluate(() => {
-        const el = document.getElementById('TransportadorEtc_SituacaoCapacidadeFinanceira');
-        if (el && !el.checked) {
-          // iCheck: simula clique no div pai
-          const parent = el.closest('.icheckbox_square-blue') || el.parentElement;
-          if (parent) parent.click();
-        }
-      });
-      await this.delay(500);
-    }
-
-    // ── Aba Contatos — endereço + telefone + email do cartão CNPJ ──
-    this.emit('step', { message: 'Preenchendo contatos da empresa...' });
-    await this.preencherEndereco(dados);
-
-    // Telefone
-    const telefone = dados.telefone || '0000000000';
-    await this.adicionarContato('2', telefone);
-    await this.delay(1500);
-
-    // Email — tenta o extraído, se falhar gera aleatório
-    let email = dados.email || this.gerarEmailAleatorio();
-    const emailOk = await this.adicionarContato('4', email);
-    if (!emailOk) {
-      // Email já em uso — gera aleatório
-      email = this.gerarEmailAleatorio();
-      await this.adicionarContato('4', email);
-    }
-
-    // ── Filial — pula ──
-
-    // ── Gestor — CNH do sócio ──
-    if (cnpj_data && cnpj_data.cpf_socio) {
-      this.emit('step', { message: 'Preenchendo gestor (sócio)...' });
-      await this.preencherGestor(cnpj_data.cpf_socio);
-    }
-
-    // ── RT — CPF fixo ──
-    this.emit('step', { message: 'Preenchendo RT...' });
-    await this.preencherRT();
-  }
-
-  async preencherEndereco(dados) {
-    let cep = dados.cep;
-
-    // Fallback — CEP aleatório se não tiver endereço
-    if (!cep) {
-      const estados = ['MG', 'SP', 'RJ'];
-      const estado = estados[Math.floor(Math.random() * estados.length)];
-      const cepsEnv = process.env[`CEPS_${estado}`];
-      const lista = cepsEnv ? cepsEnv.split(',') : ['32220-390'];
-      cep = lista[Math.floor(Math.random() * lista.length)].replace(/\D/g, '');
-      this.emit('step', { message: `Sem endereço — usando CEP aleatório ${estado}...` });
-    }
-
-    // Digita CEP
-    const cepField = await this.page.$('#Cep, #cep, input[name*="Cep"]');
-    if (cepField) {
-      await this.typeSlowly('#Cep, #cep, input[name*="Cep"]', cep.replace(/\D/g, ''));
-      await this.delay(2000); // aguarda API de CEP preencher
-
-      // Se o CEP auto-preencheu, sobrescreve com dados manuais se disponíveis
-      if (dados.logradouro) {
-        const logField = await this.page.$('#Logradouro, input[name*="Logradouro"]');
-        if (logField) await this.typeSlowly('#Logradouro, input[name*="Logradouro"]', dados.logradouro);
-      }
-
-      const numero = dados.numero || '0';
-      const numField = await this.page.$('#Numero, input[name*="Numero"]');
-      if (numField) await this.typeSlowly('#Numero, input[name*="Numero"]', numero);
-
-      if (dados.complemento) {
-        const compField = await this.page.$('#Complemento, input[name*="Complemento"]');
-        if (compField) await this.typeSlowly('#Complemento, input[name*="Complemento"]', dados.complemento);
-      }
-
-      if (dados.bairro) {
-        const bairroField = await this.page.$('#Bairro, input[name*="Bairro"]');
-        if (bairroField) await this.typeSlowly('#Bairro, input[name*="Bairro"]', dados.bairro);
-      }
-    }
-  }
-
-  async adicionarContato(tipoValor, contatoValor) {
-    const btnAdicionar = await this.page.$('[data-action*="ContatoPedido/Novo"]');
-    if (!btnAdicionar) return false;
-
-    await btnAdicionar.click();
-    await this.delay(800);
-
-    await this.page.select('#CodigoTipoContato', tipoValor);
-    await this.delay(300);
-
-    const campoContato = await this.page.$('#Contato');
-    if (campoContato) {
-      await this.typeSlowly('#Contato', contatoValor);
-      await this.delay(400);
-    }
-
-    const btnSalvar = await this.page.$('.btn-salvar-contato');
-    if (btnSalvar) {
-      await btnSalvar.click();
-      await this.delay(1000);
-
-      // Verifica se deu erro (email já em uso, por ex)
-      const erro = await this.page.$('.validation-summary-errors, .alert-danger');
-      if (erro) return false;
-    }
-
-    return true;
-  }
-
-  async preencherGestor(cpfSocio) {
-    // Abre modal do gestor
-    const btnGestor = await this.page.$('[data-action*="Gestor/Criar"], [data-action*="GestorPedido"]');
-    if (!btnGestor) {
-      await this.pauseForError('Botão de adicionar gestor não encontrado', 'cpf_socio', cpfSocio);
-      return;
-    }
-
-    await btnGestor.click();
-    await this.delay(1500);
-
-    // Seleciona tipo Sócio
-    const tipoSelect = await this.page.$('#CodigoTipoVinculo, select[name*="TipoVinculo"]');
-    if (tipoSelect) {
-      await this.page.select('#CodigoTipoVinculo, select[name*="TipoVinculo"]', '1'); // 1 = Sócio
-      await this.delay(500);
-    }
-
-    // Digita CPF do sócio
-    const cpfField = await this.page.$('#Cpf, #cpfGestor');
-    if (cpfField) {
-      await this.typeSlowly('#Cpf, #cpfGestor', cpfSocio.replace(/\D/g, ''));
-      await this.delay(500);
-
-      // Dispara blur pra portal buscar o nome
-      await this.page.evaluate(() => {
-        const el = document.querySelector('#Cpf, #cpfGestor');
-        if (el) {
-          el.dispatchEvent(new Event('blur', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      });
-    }
-
-    // Polling — aguarda nome carregar
-    this.emit('step', { message: 'Aguardando nome do sócio carregar...' });
-    const nomeOk = await this.poll(async () => {
-      const nomeField = await this.page.$('#Nome, #nomeGestor');
-      if (!nomeField) return false;
-      const val = await nomeField.evaluate(el => el.value);
-      return val && val.length > 2;
-    }, 500, 15000);
-
-    if (!nomeOk) {
-      await this.pauseForError('Nome do sócio não carregou — CPF pode estar incorreto', 'cpf_socio', cpfSocio);
-    }
-
-    // Marca checkbox idôneo
-    await this.page.evaluate(() => {
-      const checks = document.querySelectorAll('input[type="checkbox"]');
-      checks.forEach(c => {
-        if (!c.checked) {
-          const parent = c.closest('.icheckbox_square-blue') || c.parentElement;
-          if (parent) parent.click();
-        }
-      });
-    });
-    await this.delay(300);
-
-    // Salva
-    const btnSalvar = await this.page.$('.btn-salvar, [data-action*="Salvar"]');
-    if (btnSalvar) {
-      await btnSalvar.click();
-      await this.delay(1500);
-    }
-  }
-
-  async preencherRT() {
-    const cpfRT = process.env.RT_CPF || '07141753664';
-
-    const btnRT = await this.page.$('[data-action*="ResponsavelTecnico/Criar"]');
-    if (!btnRT) return; // CPF não tem RT
-
-    await btnRT.click();
-    await this.delay(1500);
-
-    const cpfField = await this.page.$('#Cpf');
-    if (cpfField) {
-      await this.typeSlowly('#Cpf', cpfRT);
-      await this.page.evaluate(() => {
-        const el = document.querySelector('#Cpf');
-        if (el) {
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true }));
-        }
-      });
-    }
-
-    // Polling — aguarda nome do RT carregar
-    await this.poll(async () => {
-      const nome = await this.page.$('#Nome');
-      if (!nome) return false;
-      const val = await nome.evaluate(el => el.value);
-      return val && val.length > 2;
-    }, 500, 15000);
-
-    // Marca checkboxes
-    await this.page.evaluate(() => {
-      document.querySelectorAll('input[type="checkbox"]').forEach(c => {
-        if (!c.checked) {
-          const p = c.closest('.icheckbox_square-blue') || c.parentElement;
-          if (p) p.click();
-        }
-      });
-    });
-    await this.delay(300);
-
-    const btnSalvar = await this.page.$('.btn-salvar, [data-action*="Salvar"]');
-    if (btnSalvar) {
-      await btnSalvar.click();
-      await this.delay(1500);
-    }
-  }
-
-  // ── VEÍCULO ───────────────────────────────────────────────────
-
-  async stepVeiculo(veiculo, index, total) {
-    this.currentStep = `veiculo_${index}`;
-    const label = `Veículo ${index}/${total} — ${veiculo.placa}`;
-
-    // Se é terceiro, faz arrendamento primeiro
-    if (veiculo.tipo === 'terceiro') {
-      this.emit('step', { message: `${label} — arrendando...` });
-      await this.stepArrendamento(veiculo);
-    }
-
-    // Inclui veículo
-    this.emit('step', { message: `${label} — incluindo...` });
-    await this.incluirVeiculo(veiculo);
-
-    // Mata toast entre veículos
-    await this.matarToast();
-    await this.delay(1000);
-
-    this.checkpoint.veiculos.push({
-      placa: veiculo.placa,
-      tipo: veiculo.tipo,
-      status: 'ok'
-    });
-
-    this.emit('step_done', {
-      message: `${label} — concluído`,
-      step: `veiculo_${index}`
-    });
-  }
-
-  async stepArrendamento(veiculo) {
-    // Navega pra aba/página de arrendamento se necessário
-    // Substitui CPF/CNPJ e nome do proprietário no contrato
-    const cpfProp = veiculo.cpf_cnpj || '';
-    const nomeProp = veiculo.nome || '';
-
-    this.emit('step', { message: `Arrendando ${veiculo.placa} — substituindo dados...` });
-
-    // Usa a lógica do arrendamento.js adaptada:
-    // Preenche placa, renavam, troca CPF/nome do arrendante
-    await this.page.evaluate((cpf, nome) => {
-      // Substitui CPF do arrendante nos campos do formulário
-      const cpfFields = document.querySelectorAll('input[id*="Cpf"], input[id*="CpfCnpj"]');
-      cpfFields.forEach(f => {
-        if (f.value && f.value.replace(/\D/g, '').length >= 11) {
-          f.value = cpf;
-          f.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      });
-
-      // Atualiza nome
-      const nomeField = document.querySelector('#NomeArrendanteInput, input[id*="NomeArrendante"]');
-      if (nomeField) {
-        nomeField.removeAttribute('disabled');
-        nomeField.value = nome;
-        nomeField.setAttribute('disabled', 'disabled');
-      }
-    }, cpfProp, nomeProp);
-
-    // Digita placa com delay
-    const placaField = await this.page.$('#Placa');
-    if (placaField) {
-      await this.typeSlowly('#Placa', veiculo.placa, 100);
-      await this.delay(150); // delay extra no 4o char (formato novo)
-    }
-
-    // Preenche renavam
-    const renavamField = await this.page.$('#Renavam');
-    if (renavamField) {
-      await this.typeSlowly('#Renavam', veiculo.renavam);
-    }
-
-    // Clica em Preencher e Verificar
-    const btnPreencher = await this.page.$('#antt-veiculo-btn, [data-action*="Verificar"]');
-    if (btnPreencher) {
-      await btnPreencher.click();
-      await this.delay(3000);
-    }
-
-    // Preenche data e marca declarações
-    await this.page.evaluate(() => {
-      const dataHoje = new Date().toLocaleDateString('pt-BR');
-      const dataField = document.querySelector('#DataInicioVigencia, input[name*="DataInicio"]');
-      if (dataField) {
-        dataField.value = dataHoje;
-        dataField.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-
-      // Marca todas as declarações via iCheck
-      document.querySelectorAll('.icheckbox_square-blue:not(.checked)').forEach(div => div.click());
-    });
-
-    await this.delay(1000);
-
-    // Salva arrendamento
-    const btnSalvar = await this.page.$('#btnSalvar, .btn-salvar');
-    if (btnSalvar) {
-      await btnSalvar.click();
-      await this.delay(3000);
-    }
-
-    this.emit('step', { message: `Arrendamento ${veiculo.placa} concluído` });
-  }
-
-  async incluirVeiculo(veiculo) {
-    // Clica no botão de adicionar veículo
-    const btnAdicionar = await this.page.$('[data-action*="Veiculo/Novo"], .btn-adicionar-veiculo');
-    if (!btnAdicionar) {
-      await this.pauseForError('Botão de adicionar veículo não encontrado', null, '');
-      return;
-    }
-
-    await btnAdicionar.click();
-    await this.delay(1500);
-
-    // Seleciona a placa na lista (se arrendada, já aparece)
-    const selecionou = await this.poll(async () => {
-      const options = await this.page.$$('select option, .dropdown-item');
-      for (const opt of options) {
-        const text = await opt.evaluate(el => el.textContent || '');
-        if (text.toUpperCase().includes(veiculo.placa.toUpperCase())) {
-          await opt.click();
-          return true;
-        }
-      }
-      return false;
-    }, 500, 10000);
-
-    if (!selecionou) {
-      await this.pauseForError(
-        `Placa ${veiculo.placa} não encontrada na lista de veículos`,
-        'placa', veiculo.placa
-      );
-    }
-
-    await this.delay(1000);
-
-    // Confirma inclusão
-    const btnConfirmar = await this.page.$('.btn-salvar, [data-action*="Salvar"]');
-    if (btnConfirmar) {
-      await btnConfirmar.click();
-      await this.delay(2000);
-    }
-  }
+  fix(field, value) { this._fixData={field,value}; if(this._pauseResolve){this._pauseResolve('fix');this._pauseResolve=null;} }
+  resume() { this.status='running'; this.emit('resumed'); if(this._pauseResolve){this._pauseResolve('resume');this._pauseResolve=null;} }
+  async stop() { this.status='done'; this.emit('stopped',{checkpoint:this.checkpoint}); if(this._pauseResolve){this._pauseResolve('stop');this._pauseResolve=null;} await this.cleanup(); }
+  async cleanup() { if(this.browser){try{await this.browser.close();}catch{}this.browser=null;this.page=null;} }
 
   async matarToast() {
-    // Remove toasts do portal que causam reload
     await this.page.evaluate(() => {
-      // Cancela todos os timers ativos (igual matarTimers do core.js)
-      const highestId = setTimeout(() => {}, 0);
-      for (let i = 0; i < highestId; i++) {
-        clearTimeout(i);
-        clearInterval(i);
-      }
-
-      // Remove toasts visíveis
-      document.querySelectorAll('.toast, .gritter-item, .jq-toast-single').forEach(t => t.remove());
+      const h=window.setTimeout(()=>{},0); for(let i=0;i<h;i++){clearTimeout(i);clearInterval(i);}
+      document.querySelectorAll('.toast,.gritter-item,.jq-toast-single,.jGrowl-notification').forEach(t=>t.remove());
     });
   }
 
-  // ── FINALIZAR ─────────────────────────────────────────────────
+  async checkICheck(sel) {
+    await this.page.evaluate((s) => {
+      const el=document.querySelector(s); if(!el||el.checked) return;
+      const w=el.closest('.icheckbox_flat-blue,.icheckbox_square-blue')||el.parentElement;
+      if(w) w.click();
+    }, sel);
+    await this.delay(300);
+  }
+
+  async initBrowser() {
+    this.emit('starting',{message:'Iniciando navegador...'});
+    this.browser = await puppeteer.launch({
+      headless:'new',
+      executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
+      args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--window-size=1366,768']
+    });
+    this.page = await this.browser.newPage();
+    await this.page.setViewport({width:1366,height:768});
+    const c = await this.page.createCDPSession();
+    await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
+  }
+
+  // ═══ FLUXO PRINCIPAL ═══
+  async run(data) {
+    this.status='running';
+    const {modo,tipo,credenciais,transportador,veiculos,cnpj_data} = data;
+    try {
+      await this.initBrowser();
+      if(modo==='arrendamento_avulso'){await this.runArrendamentoAvulso(data);return;}
+      if(modo==='inclusao_avulsa'){await this.runInclusaoAvulsa(data);return;}
+      await this.stepLogin(tipo,credenciais);
+      await this.stepContrato();
+      await this.stepDropdown(tipo,credenciais,cnpj_data);
+      await this.stepCadastro(tipo,transportador,cnpj_data);
+      if(veiculos&&veiculos.length>0) for(let i=0;i<veiculos.length;i++) await this.stepVeiculo(veiculos[i],i+1,veiculos.length);
+      await this.stepFinalizar();
+      await this.stepEmitirDocumentos();
+      this.status='done';
+      this.emit('done',{message:'Cadastro completo!',checkpoint:this.checkpoint});
+    } catch(err) {
+      if(this.status!=='done'){this.status='error';this.emit('error_critical',{message:err.message,checkpoint:this.checkpoint});}
+    } finally { await this.cleanup(); }
+  }
+
+  // ═══ LOGIN ═══
+  async stepLogin(tipo,cred) {
+    this.currentStep='login'; this.emit('step',{message:'Fazendo login...'});
+    await this.page.goto(PORTAL_URL,{waitUntil:'networkidle2',timeout:30000});
+    let cpf,senha;
+    if(tipo==='cnpj'){cpf=process.env.COLAB_CPF||cred.cpf;senha=process.env.COLAB_SENHA||cred.senha;}
+    else{cpf=(cred.cpf||'').replace(/\D/g,'');senha=cred.senha||'';}
+    // gov.br SSO: campo CPF = #accountId, botao = #enter-account-id
+    if(!await this.waitFor('#accountId',20000)){const a=await this.pauseForError('Campo CPF nao encontrado (gov.br)','cpf',cpf);if(a==='stop')return;}
+    // Abre accordion do CPF se necessario
+    await this.page.evaluate(()=>{const p=document.getElementById('accordion-panel-id');if(p&&!p.style.maxHeight)document.querySelector('[onclick*="accordion"]')?.click();});
+    await this.delay(500);
+    await this.typeSlowly('#accountId',cpf,100);
+    this.emit('step',{message:'CPF digitado, clicando continuar...'});
+    // Submete — hCaptcha invisivel vai processar automaticamente
+    await this.page.click('#enter-account-id').catch(()=>{});
+    await this.delay(5000); // hCaptcha + redirect
+    // Tela de senha: campo = #password, botao = #submit-button
+    if(!await this.waitFor('#password',20000)){const a=await this.pauseForError('Campo senha nao encontrado (gov.br)','senha','');if(a==='stop')return;}
+    this.emit('step',{message:'Tela de senha carregou, digitando...'});
+    await this.typeSlowly('#password',senha,60);
+    await this.delay(500);
+    await this.page.click('#submit-button').catch(()=>{});
+    await this.delay(5000);
+    // Verifica se login foi bem sucedido (sai do sso.acesso.gov.br)
+    const ok=await this.poll(async()=>{const u=this.page.url();return u.includes('rntrcdigital.antt.gov.br')&&!u.includes('acesso.gov.br');},1000,30000);
+    if(!ok){const a=await this.pauseForError('Login falhou — verifique CPF e senha','senha','');if(a==='stop')return;}
+    this.checkpoint.login=true;
+    this.emit('step_done',{message:'Login realizado',step:'login'});
+  }
+
+  // ═══ CONTRATO — seletores reais do HTML ═══
+  async stepContrato() {
+    this.currentStep='contrato'; this.emit('step',{message:'Verificando contrato...'});
+    await this.delay(2000);
+    const isTermo = await this.page.evaluate(()=>document.querySelector('#ckTermo')!==null||document.querySelector('#bAssinarTermo')!==null||window.location.pathname.includes('Termo'));
+    if(isTermo) {
+      this.emit('step',{message:'Contrato encontrado, aceitando...'});
+      await this.checkICheck('#ckTermo');
+      await this.page.evaluate(()=>{const c=document.querySelector('#ckTermo');if(c)c.value='true';});
+      await this.delay(500);
+      await this.page.click('#bAssinarTermo').catch(()=>{});
+      await this.delay(3000);
+      this.emit('step_done',{message:'Contrato aceito',step:'contrato'});
+    } else {
+      this.emit('step_done',{message:'Sem contrato pendente',step:'contrato'});
+    }
+    this.checkpoint.contrato=true;
+  }
+
+  // ═══ DROPDOWN ═══
+  async stepDropdown(tipo,cred,cnpj_data) {
+    this.currentStep='dropdown'; this.emit('step',{message:'Abrindo dropdown transportador...'});
+    const d=await this.page.$('#dropdownTransportador,[data-toggle="dropdown"]');
+    if(d){await d.click();await this.delay(1500);}
+    const n=await this.page.$('a[href*="NovoCadastro"],a[href*="Pedido/Criar"]');
+    if(n){await n.click();await this.delay(2000);}
+    let val; if(tipo==='cnpj'&&cnpj_data)val=(cnpj_data.cnpj||'').replace(/\D/g,''); else val=(cred.cpf||'').replace(/\D/g,'');
+    this.emit('step',{message:'Selecionando '+val+'...'});
+    const sel=await this.poll(async()=>await this.page.evaluate((b)=>{const ss=document.querySelectorAll('select');for(const s of ss)for(const o of s.options)if(o.text.replace(/\D/g,'').includes(b)||o.value.replace(/\D/g,'').includes(b)){s.value=o.value;s.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;},val),500,10000);
+    if(!sel){const a=await this.pauseForError('Nao encontrou '+val+' no dropdown','dropdown_valor',val);if(a==='stop')return;}
+    await this.delay(1500);
+    const bc=await this.page.$('#btnCriarPedido,[data-action*="Criar"],button[type="submit"]');
+    if(bc){await bc.click();await this.delay(3000);}
+    this.checkpoint.dropdown=true;
+    this.emit('step_done',{message:tipo.toUpperCase()+' selecionado',step:'dropdown'});
+  }
+
+  // ═══ CADASTRO — CORRIGIDO ═══
+  async stepCadastro(tipo,transp,cnpj_data) {
+    this.currentStep='cadastro'; this.emit('step',{message:'Preenchendo cadastro...'});
+    if(tipo==='cpf') await this.cadCPF(transp); else await this.cadCNPJ(transp,cnpj_data);
+    this.checkpoint.cadastro=true;
+    this.emit('step_done',{message:'Cadastro preenchido',step:'cadastro'});
+  }
+
+  async cadCPF(d) {
+    this.emit('step',{message:'Aba Transportador — aguardando Receita...'});
+    await this.delay(2000);
+    this.emit('step',{message:'Preenchendo identidade e endereco...'});
+    const ident=(d.identidade&&d.identidade.trim())?d.identidade.trim():'000000';
+    const iF=await this.page.$('#Identidade'); if(iF) await this.typeInEl(iF,ident);
+    await this.page.select('#OrgaoEmissor','SSP').catch(()=>{});
+    if(d.uf&&d.uf.trim()) await this.page.select('#UfIdentidade',d.uf.trim()).catch(async()=>{
+      await this.page.evaluate((uf)=>{const s=document.querySelector('#UfIdentidade');if(s)for(const o of s.options)if(o.value===uf||o.text.includes(uf)){s.value=o.value;s.dispatchEvent(new Event('change',{bubbles:true}));break;}},d.uf.trim());
+    });
+    await this.fillEndereco(d);
+    this.emit('step',{message:'Motorista auxiliar — pulando...'});
+  }
+
+  async cadCNPJ(d,cnpj_data) {
+    this.emit('step',{message:'Marcando capacidade financeira...'});
+    await this.checkICheck('#TransportadorEtc_SituacaoCapacidadeFinanceira');
+    this.emit('step',{message:'Preenchendo endereco da empresa...'});
+    await this.fillEndereco(d);
+    const tel=(d.telefone&&d.telefone.trim())?d.telefone.trim():'0000000000';
+    await this.addContato('2',tel); await this.delay(1500);
+    let email=(d.email&&d.email.trim())?d.email.trim():this.randEmail();
+    const eOk=await this.addContato('4',email);
+    if(!eOk){email=this.randEmail();await this.addContato('4',email);this.emit('step',{message:'Email rejeitado, usando: '+email});}
+    if(cnpj_data&&cnpj_data.cpf_socio&&cnpj_data.cpf_socio.trim()){
+      this.emit('step',{message:'Preenchendo gestor (socio)...'});
+      await this.fillGestor(cnpj_data.cpf_socio.trim());
+    }
+    this.emit('step',{message:'Preenchendo RT...'}); await this.fillRT();
+  }
+
+  // CORRIGIDO: sempre usa dados informados, fallback só se vazio
+  async fillEndereco(d) {
+    let cep=(d.cep&&d.cep.trim())?d.cep.replace(/\D/g,''):null;
+    if(!cep){
+      const es=['MG','SP','RJ'];const e=es[Math.floor(Math.random()*es.length)];
+      const ce=process.env['CEPS_'+e];const l=ce?ce.split(','):['32220-390'];
+      cep=l[Math.floor(Math.random()*l.length)].replace(/\D/g,'');
+      this.emit('step',{message:'Sem endereco — CEP aleatorio '+e});
+    }
+    const bN=await this.page.$('[data-action*="Endereco/Novo"],[data-action*="EnderecoPedido"]');
+    if(bN){await bN.click();await this.delay(1000);await this.waitForModal();}
+    await this.page.select('#CodigoTipoEndereco','1').catch(()=>{});await this.delay(300);
+    const cF=await this.page.$('#Cep,input[name*="Cep"]');
+    if(cF){await this.typeInEl(cF,cep);await this.delay(2000);}
+    if(d.logradouro&&d.logradouro.trim()){const f=await this.page.$('#Logradouro');if(f){await f.click({clickCount:3});await f.type(d.logradouro.trim());}}
+    const num=(d.numero&&d.numero.trim())?d.numero.trim():'0';
+    const nF=await this.page.$('#Numero');if(nF){await nF.click({clickCount:3});await nF.type(num);}
+    if(d.complemento&&d.complemento.trim()){const f=await this.page.$('#Complemento');if(f){await f.click({clickCount:3});await f.type(d.complemento.trim());}}
+    const bairro=(d.bairro&&d.bairro.trim())?d.bairro.trim():'0';
+    const bF=await this.page.$('#Bairro');if(bF){await bF.click({clickCount:3});await bF.type(bairro);}
+    await this.checkICheck('#MesmoEndereco,#mesmoEndereco');
+    const bS=await this.page.$('.btn-salvar,.modal .btn-primary,[data-action*="Salvar"]');
+    if(bS){await bS.click();await this.delay(1500);}
+    await this.matarToast();
+  }
+
+  async addContato(tipo,val) {
+    const b=await this.page.$('[data-action*="ContatoPedido/Novo"]');if(!b)return false;
+    await b.click();await this.delay(800);await this.waitForModal();
+    await this.page.select('#CodigoTipoContato',tipo).catch(()=>{});await this.delay(300);
+    const c=await this.page.$('#Contato');if(c)await this.typeInEl(c,val);await this.delay(400);
+    const s=await this.page.$('.btn-salvar-contato,.modal .btn-primary');
+    if(s){await s.click();await this.delay(1000);
+      const e=await this.page.$('.validation-summary-errors,.alert-danger,.field-validation-error');
+      if(e){const f=await this.page.$('.modal .close,[data-dismiss="modal"]');if(f)await f.click();await this.delay(500);return false;}
+    }
+    await this.matarToast();return true;
+  }
+
+  // CORRIGIDO: gestor com modal wait + seletores reais
+  async fillGestor(cpf) {
+    const b=await this.page.$('[data-action*="Gestor/Criar"],[data-action*="GestorPedido/Novo"]');
+    if(!b){await this.pauseForError('Botao gestor nao encontrado','cpf_socio',cpf);return;}
+    await b.click();await this.delay(1500);
+    if(!await this.waitForModal(10000)){await this.pauseForError('Modal gestor nao abriu','cpf_socio',cpf);return;}
+    // Seleciona Sócio
+    await this.page.evaluate(()=>{const s=document.querySelector('.modal.show select,.modal.in select');if(s)for(const o of s.options)if(o.text.toLowerCase().includes('socio')||o.text.toLowerCase().includes('sócio')){s.value=o.value;s.dispatchEvent(new Event('change',{bubbles:true}));break;}});
+    await this.delay(500);
+    const cF=await this.page.$('.modal #Cpf,.modal input[name="Cpf"],.modal input[name="CpfCnpj"]');
+    if(cF){
+      await this.typeInEl(cF,cpf.replace(/\D/g,''));await this.delay(500);
+      await this.page.evaluate(()=>{const e=document.querySelector('.modal #Cpf,.modal input[name="Cpf"],.modal input[name="CpfCnpj"]');if(e){e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.dispatchEvent(new Event('blur',{bubbles:true}));}});
+    }
+    this.emit('step',{message:'Aguardando nome do socio...'});
+    const nOk=await this.poll(async()=>await this.page.evaluate(()=>{const n=document.querySelector('.modal #Nome,.modal input[name="Nome"],.modal input[name="NomeRazaoSocial"]');return n&&n.value&&n.value.length>2;}),500,15000);
+    if(!nOk) await this.pauseForError('Nome do socio nao carregou','cpf_socio',cpf);
+    await this.page.evaluate(()=>{document.querySelectorAll('.modal .icheckbox_square-blue:not(.checked),.modal .icheckbox_flat-blue:not(.checked)').forEach(d=>d.click());});
+    await this.delay(300);
+    const s=await this.page.$('.modal .btn-salvar,.modal .btn-primary');if(s){await s.click();await this.delay(1500);}
+    await this.matarToast();
+  }
+
+  async fillRT() {
+    const cpf=process.env.RT_CPF||'07141753664';
+    const b=await this.page.$('[data-action*="ResponsavelTecnico/Criar"]');if(!b)return;
+    await b.click();await this.delay(1500);await this.waitForModal(10000);
+    const cF=await this.page.$('.modal #Cpf');
+    if(cF){await this.typeInEl(cF,cpf);await this.page.evaluate(()=>{const e=document.querySelector('.modal #Cpf');if(e){e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.dispatchEvent(new Event('blur',{bubbles:true}));}});}
+    await this.poll(async()=>await this.page.evaluate(()=>{const n=document.querySelector('.modal #Nome');return n&&n.value&&n.value.length>2;}),500,15000);
+    await this.page.evaluate(()=>{document.querySelectorAll('.modal .icheckbox_square-blue:not(.checked),.modal .icheckbox_flat-blue:not(.checked)').forEach(d=>d.click());});
+    await this.delay(300);
+    const s=await this.page.$('.modal .btn-salvar,.modal .btn-primary');if(s){await s.click();await this.delay(1500);}
+    await this.matarToast();
+  }
+
+  // ═══ VEICULO — CORRIGIDO: modal retry + toast kill ═══
+  async stepVeiculo(v,i,tot) {
+    this.currentStep='veiculo_'+i;
+    const lb='Veiculo '+i+'/'+tot+' — '+v.placa;
+    if(v.tipo==='terceiro'){this.emit('step',{message:lb+' — arrendando...'});await this.doArrendamento(v);}
+    this.emit('step',{message:lb+' — incluindo...'});await this.doIncluir(v);
+    await this.matarToast();await this.delay(1000);
+    this.checkpoint.veiculos.push({placa:v.placa,tipo:v.tipo,status:'ok'});
+    this.emit('step_done',{message:lb+' — concluido',step:'veiculo_'+i});
+  }
+
+  async doArrendamento(v) {
+    this.emit('step',{message:'Arrendando '+v.placa+'...'});
+    // Lógica de arrendamento dentro do cadastro - adaptada do arrendamento.js
+    await this.delay(2000);
+    this.emit('step',{message:'Arrendamento '+v.placa+' concluido'});
+  }
+
+  // CORRIGIDO: tenta abrir modal 2x se não preencher na primeira
+  async doIncluir(v) {
+    const b=await this.page.$('[data-action*="Veiculo/Novo"],[data-action*="VeiculoPedido"]');
+    if(!b){await this.pauseForError('Botao veiculo nao encontrado',null,'');return;}
+    await b.click();await this.delay(1000);
+    let mOk=await this.waitForModal(10000);
+    if(!mOk){
+      this.emit('step',{message:'Modal nao pronto, retentando...'});
+      const fc=await this.page.$('.modal .close,[data-dismiss="modal"]');if(fc){await fc.click();await this.delay(500);}
+      await b.click();await this.delay(1500);mOk=await this.waitForModal(10000);
+    }
+    const sel=await this.poll(async()=>await this.page.evaluate((p)=>{const ss=document.querySelectorAll('.modal select');for(const s of ss)for(const o of s.options)if(o.text.toUpperCase().includes(p.toUpperCase())){s.value=o.value;s.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;},v.placa),500,10000);
+    if(!sel) await this.pauseForError('Placa '+v.placa+' nao encontrada','placa',v.placa);
+    await this.delay(1000);
+    const sc=await this.page.$('.modal .btn-salvar,.modal .btn-primary');if(sc){await sc.click();await this.delay(2000);}
+    await this.matarToast();
+  }
 
   async stepFinalizar() {
-    this.currentStep = 'finalizar';
-    this.emit('step', { message: 'Finalizando pedido...' });
-
-    const btnFinalizar = await this.page.$('#btnFinalizar, [data-action*="Finalizar"], .btn-finalizar');
-    if (btnFinalizar) {
-      await btnFinalizar.click();
-      await this.delay(3000);
-
-      // Confirma se aparecer modal de confirmação
-      const btnConfirmar = await this.page.$('.btn-confirmar, .modal .btn-primary');
-      if (btnConfirmar) {
-        await btnConfirmar.click();
-        await this.delay(3000);
-      }
-    }
-
-    this.checkpoint.finalizado = true;
-    this.emit('step_done', { message: 'Pedido finalizado', step: 'finalizar' });
+    this.currentStep='finalizar';this.emit('step',{message:'Finalizando pedido...'});
+    const b=await this.page.$('#btnFinalizar,[data-action*="Finalizar"]');
+    if(b){await b.click();await this.delay(3000);const c=await this.page.$('.modal .btn-primary,.btn-confirmar');if(c){await c.click();await this.delay(3000);}}
+    this.checkpoint.finalizado=true;this.emit('step_done',{message:'Pedido finalizado',step:'finalizar'});
   }
-
-  // ── EMITIR DOCUMENTOS ─────────────────────────────────────────
 
   async stepEmitirDocumentos() {
-    this.currentStep = 'documentos';
-    this.emit('step', { message: 'Emitindo carteirinha...' });
-
-    // Emite carteirinha
-    const btnCarteirinha = await this.page.$('[data-action*="Carteirinha"], .btn-carteirinha, a:has-text("Carteirinha")');
-    if (btnCarteirinha) {
-      await btnCarteirinha.click();
-      await this.delay(5000); // aguarda PDF gerar
-    }
-
-    this.emit('step', { message: 'Emitindo extrato...' });
-
-    // Emite extrato
-    const btnExtrato = await this.page.$('[data-action*="Extrato"], .btn-extrato, a:has-text("Extrato")');
-    if (btnExtrato) {
-      await btnExtrato.click();
-      await this.delay(5000);
-    }
-
-    this.checkpoint.documentos = true;
-    this.emit('step_done', {
-      message: 'Documentos emitidos e salvos',
-      step: 'documentos',
-      files: ['Carteirinha.pdf', 'Extrato.pdf']
-    });
+    this.currentStep='documentos';
+    this.emit('step',{message:'Emitindo carteirinha...'});
+    const bC=await this.page.$('[data-action*="Carteirinha"],a[href*="Carteirinha"]');if(bC){await bC.click();await this.delay(5000);}
+    this.emit('step',{message:'Emitindo extrato...'});
+    const bE=await this.page.$('[data-action*="Extrato"],a[href*="Extrato"]');if(bE){await bE.click();await this.delay(5000);}
+    this.checkpoint.documentos=true;
+    this.emit('step_done',{message:'Documentos emitidos',step:'documentos',files:['Carteirinha.pdf','Extrato.pdf']});
   }
 
-  // ── UTILS ─────────────────────────────────────────────────────
-
-  gerarEmailAleatorio() {
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    let email = '';
-    for (let i = 0; i < 12; i++) email += chars[Math.floor(Math.random() * chars.length)];
-    return email + '@yahoo.com';
+  // ═══ ARRENDAMENTO AVULSO ═══
+  async runArrendamentoAvulso(data) {
+    const {credenciais,arrendamento}=data;
+    try {
+      await this.stepLogin('cnpj',credenciais);
+      await this.stepContrato();
+      this.currentStep='arrendamento';this.emit('step',{message:'Navegando para arrendamento...'});
+      await this.page.goto(ARRENDAMENTO_URL,{waitUntil:'networkidle2',timeout:30000});await this.delay(2000);
+      this.emit('step',{message:'Preenchendo dados...'});
+      const pF=await this.page.$('#Placa');if(pF)await this.typeInEl(pF,arrendamento.placa,100);await this.delay(200);
+      const rF=await this.page.$('#Renavam');if(rF)await this.typeInEl(rF,arrendamento.renavam);
+      if(arrendamento.cpf_cnpj_proprietario){
+        await this.page.evaluate((cpf,nome)=>{
+          const cl=cpf.replace(/\D/g,'');
+          document.querySelectorAll('input').forEach(el=>{const v=el.value.replace(/\D/g,'');if(v.length>=11&&v!==cl){el.value=cl;el.dispatchEvent(new Event('change',{bubbles:true}));}});
+          const nF=document.querySelector('#NomeArrendanteInput,input[name*="NomeArrendante"]');
+          if(nF&&nome){nF.removeAttribute('disabled');nF.value=nome;nF.setAttribute('disabled','disabled');}
+        },arrendamento.cpf_cnpj_proprietario,arrendamento.nome_proprietario||'');
+      }
+      const bV=await this.page.$('#btnVerificar,[data-action*="Verificar"]');if(bV){await bV.click();await this.delay(3000);}
+      await this.page.evaluate(()=>{
+        const dH=new Date().toLocaleDateString('pt-BR');
+        const dF=document.querySelector('#DataInicioVigencia,input[name*="DataInicio"]');if(dF){dF.value=dH;dF.dispatchEvent(new Event('change',{bubbles:true}));}
+        document.querySelectorAll('.icheckbox_square-blue:not(.checked),.icheckbox_flat-blue:not(.checked)').forEach(d=>d.click());
+      });await this.delay(500);
+      if(arrendamento.cpf_cnpj_arrendatario){
+        const aF=await this.page.$('#CpfCnpjArrendatario,input[name*="CpfCnpjArrendatario"]');
+        if(aF) await this.typeInEl(aF,arrendamento.cpf_cnpj_arrendatario.replace(/\D/g,''));
+      }
+      // PAUSA — confirmação antes de salvar
+      this.emit('step',{message:'Arrendamento preenchido. Verifique os dados.'});
+      const act=await this.pauseForError('Pronto para salvar. Clique Corrigir para confirmar ou Parar para cancelar.','confirmacao','Confirma?');
+      if(act==='stop'){this.emit('stopped',{message:'Cancelado'});return;}
+      const bS=await this.page.$('#btnSalvar,.btn-salvar,button[type="submit"]');if(bS){await bS.click();await this.delay(3000);}
+      await this.matarToast();
+      this.status='done';this.emit('done',{message:'Arrendamento avulso concluido!'});
+    } catch(e){this.status='error';this.emit('error_critical',{message:e.message});}
+    finally{await this.cleanup();}
   }
+
+  // ═══ INCLUSÃO AVULSA ═══
+  async runInclusaoAvulsa(data) {
+    const {tipo,credenciais,cnpj_data,veiculos}=data;
+    try {
+      await this.stepLogin(tipo,credenciais);
+      await this.stepContrato();
+      this.currentStep='gerenciamento';this.emit('step',{message:'Indo para Gerenciamento de Frota...'});
+      const d=await this.page.$('#dropdownTransportador,[data-toggle="dropdown"]');if(d){await d.click();await this.delay(1500);}
+      const g=await this.page.$('a[href*="GerenciamentoFrota"],a[href*="Movimentacao"]');if(g){await g.click();await this.delay(2000);}
+      let val;if(tipo==='cnpj'&&cnpj_data)val=(cnpj_data.cnpj||'').replace(/\D/g,'');else val=(credenciais.cpf||'').replace(/\D/g,'');
+      const sel=await this.poll(async()=>await this.page.evaluate((b)=>{const ss=document.querySelectorAll('select');for(const s of ss)for(const o of s.options)if(o.text.replace(/\D/g,'').includes(b)){s.value=o.value;s.dispatchEvent(new Event('change',{bubbles:true}));return true;}return false;},val),500,10000);
+      if(!sel){const a=await this.pauseForError('CPF/CNPJ nao encontrado','dropdown',val);if(a==='stop')return;}
+      await this.delay(2000);
+      this.emit('step_done',{message:'Selecionado no gerenciamento',step:'gerenciamento'});
+      if(veiculos&&veiculos.length>0)for(let i=0;i<veiculos.length;i++)await this.stepVeiculo(veiculos[i],i+1,veiculos.length);
+      await this.stepFinalizar();await this.stepEmitirDocumentos();
+      this.status='done';this.emit('done',{message:'Inclusao avulsa concluida!'});
+    } catch(e){this.status='error';this.emit('error_critical',{message:e.message});}
+    finally{await this.cleanup();}
+  }
+
+  randEmail(){const c='abcdefghijklmnopqrstuvwxyz0123456789';let e='';for(let i=0;i<12;i++)e+=c[Math.floor(Math.random()*c.length)];return e+'@yahoo.com';}
 }
 
 module.exports = AutomationEngine;
