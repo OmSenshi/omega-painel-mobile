@@ -96,8 +96,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="sec"><div class="st">Modo</div>
 <div class="tabs" id="mt"><div class="a" onclick="swM('cadastro')">Cadastro</div><div onclick="swM('arrendamento')">Arrendamento</div><div onclick="swM('inclusao')">Inclusão</div></div></div>
 
-<div class="sec"><div class="st">Importar do WhatsApp</div>
-<div class="imp"><input type="text" id="wc" placeholder="Código (ex: VALDIR1252)"><button onclick="impW()">Importar</button></div></div>
+<div class="sec"><div class="st">Importar dados</div>
+<div class="imp"><input type="text" id="wc" placeholder="Código WhatsApp (ex: VALDIR1252)"><button onclick="impW()">Importar</button></div>
+<div class="imp" style="margin-top:6px"><input type="text" id="oc" placeholder="Código Omega (tipo=CPF|identidade=...|uf=...)"><button onclick="impO()">Importar</button></div>
+</div>
 
 <!-- CADASTRO -->
 <div class="mp active" id="mode-cadastro">
@@ -211,6 +213,38 @@ function goI(){const d={modo:'inclusao_avulsa',tipo:iT,credenciais:{},veiculos:g
 async function fire(d){document.getElementById('form-screen').classList.add('hidden');document.getElementById('status-screen').classList.add('active');document.getElementById('htitle').innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#0F6E56;margin-right:8px"></span>Executando';const es=new EventSource('/api/status/stream');es.onmessage=e=>hEv(JSON.parse(e.data));try{const r=await fetch('/api/automation/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});const j=await r.json();if(!j.success)alert(j.error);}catch(e){alert(e.message);}}
 
 async function impW(){const c=document.getElementById('wc').value.trim();if(!c){alert('Digite o código');return;}try{const r=await fetch('/api/import/'+c);const j=await r.json();if(!j.success){alert('Código não encontrado');return;}const d=j.data;if(d.cnh){if(d.cnh.identidade)document.getElementById('ci').value=d.cnh.identidade;if(d.cnh.uf)document.getElementById('cu').value=d.cnh.uf;}if(d.comprovante){if(d.comprovante.cep)document.getElementById('ce').value=d.comprovante.cep;if(d.comprovante.logradouro)document.getElementById('cl').value=d.comprovante.logradouro;if(d.comprovante.numero)document.getElementById('cn').value=d.comprovante.numero;if(d.comprovante.complemento)document.getElementById('co').value=d.comprovante.complemento;if(d.comprovante.bairro)document.getElementById('cb').value=d.comprovante.bairro;}if(d.cartao_cnpj){if(d.cartao_cnpj.cep)document.getElementById('ne').value=d.cartao_cnpj.cep;if(d.cartao_cnpj.logradouro)document.getElementById('nl').value=d.cartao_cnpj.logradouro;if(d.cartao_cnpj.numero)document.getElementById('nn').value=d.cartao_cnpj.numero;if(d.cartao_cnpj.complemento)document.getElementById('nc').value=d.cartao_cnpj.complemento;if(d.cartao_cnpj.bairro)document.getElementById('nb').value=d.cartao_cnpj.bairro;if(d.cartao_cnpj.telefone)document.getElementById('nt').value=d.cartao_cnpj.telefone;if(d.cartao_cnpj.email)document.getElementById('nm').value=d.cartao_cnpj.email;}if(d.cnh_socio&&d.cnh_socio.cpf_socio)document.getElementById('ns').value=d.cnh_socio.cpf_socio;if(d.crlv&&d.crlv.length>0)d.crlv.forEach((v,i)=>{if(i>=vc.c)aV('c');const n=i+1;if(v.placa)document.getElementById('c'+n+'p').value=v.placa;if(v.renavam)document.getElementById('c'+n+'r').value=v.renavam;if(v.cpf_cnpj)document.getElementById('c'+n+'c').value=v.cpf_cnpj;if(v.nome)document.getElementById('c'+n+'n').value=v.nome;});alert('Importado!');}catch(e){alert(e.message);}}
+
+// ═══ Importar Código Omega (formato Tampermonkey) ═══
+// Formato CPF: tipo=CPF|identidade=VALOR|uf=VALOR|cep=VALOR|logradouro=VALOR|numero=VALOR|complemento=VALOR|bairro=VALOR
+// Formato CNPJ: tipo=CNPJ|cep=VALOR|logradouro=VALOR|numero=VALOR|complemento=VALOR|bairro=VALOR|telefone=VALOR|email=VALOR|cpf_socio=VALOR
+function impO(){
+const raw=document.getElementById('oc').value.trim();
+if(!raw){alert('Cole o código Omega');return;}
+const d={};
+raw.split('|').forEach(par=>{const[k,...vp]=par.split('=');if(k)d[k.trim().toLowerCase()]=vp.join('=').trim();});
+if(!d.tipo){alert('Código inválido — campo "tipo" não encontrado');return;}
+const t=d.tipo.toLowerCase();
+swT(t);
+if(t==='cpf'){
+if(d.identidade)document.getElementById('ci').value=d.identidade;
+if(d.uf)document.getElementById('cu').value=d.uf;
+if(d.cep)document.getElementById('ce').value=d.cep;
+if(d.logradouro)document.getElementById('cl').value=d.logradouro;
+if(d.numero)document.getElementById('cn').value=d.numero;
+if(d.complemento)document.getElementById('co').value=d.complemento;
+if(d.bairro)document.getElementById('cb').value=d.bairro;
+}else{
+if(d.cep)document.getElementById('ne').value=d.cep;
+if(d.logradouro)document.getElementById('nl').value=d.logradouro;
+if(d.numero)document.getElementById('nn').value=d.numero;
+if(d.complemento)document.getElementById('nc').value=d.complemento;
+if(d.bairro)document.getElementById('nb').value=d.bairro;
+if(d.telefone)document.getElementById('nt').value=d.telefone;
+if(d.email)document.getElementById('nm').value=d.email;
+if(d.cpf_socio)document.getElementById('ns').value=d.cpf_socio;
+}
+alert('Código Omega importado! ('+t.toUpperCase()+')');}
+
 
 let pg=0;const ts=8;
 function hEv(m){switch(m.event){case'step':uS(m.step,m.message,'sa');break;case'step_done':uS(m.step,m.message,'sd');pg++;uP();break;case'error':uS(m.step,m.message,'se');sE(m);document.getElementById('htitle').innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#BA7517;margin-right:8px"></span>Pausado';document.querySelector('.pf').classList.add('error');break;case'error_critical':uS(m.step||'fatal',m.message,'se');document.getElementById('htitle').innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#A32D2D;margin-right:8px"></span>Erro fatal';break;case'done':document.getElementById('htitle').innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#0F6E56;margin-right:8px"></span>Concluído';pg=ts;uP();eDl();break;case'resumed':document.getElementById('erc').innerHTML='';document.getElementById('htitle').innerHTML='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#0F6E56;margin-right:8px"></span>Executando';document.querySelector('.pf').classList.remove('error');break;}}
