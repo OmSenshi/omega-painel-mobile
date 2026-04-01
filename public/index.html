@@ -128,7 +128,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="f"><label>CPF do sócio (gestor)</label><input type="text" id="ns" inputmode="numeric"></div>
 <div class="note">RT = CPF fixo automático (.env)</div></div>
 <div class="sec"><div class="st">Veículos</div><div class="note">Extração opcional — dados manuais aceitos</div><div id="vl-c"></div><div class="ab" onclick="aV('c')">+ Adicionar veículo</div></div>
-<div class="sec"><button class="go" onclick="goC()">Iniciar cadastro</button><p class="hint">Cadastro completo antes dos veículos. Arrendamento antes da inclusão.</p></div>
+<div class="sec"><div class="r2" style="gap:8px"><button class="go" onclick="goC()" style="margin:0">Iniciar cadastro</button><button class="go" onclick="salvarCadastro()" style="margin:0;background:var(--g)">Salvar</button></div><p class="hint">Cadastro completo antes dos veículos. Arrendamento antes da inclusão.</p></div>
 </div>
 
 <!-- ARRENDAMENTO -->
@@ -152,6 +152,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="sec"><div class="st">Veículos</div><div class="note">Próprio = inclusão. Terceiro = arrendamento + inclusão.</div><div id="vl-i"></div><div class="ab" onclick="aV('i')">+ Adicionar veículo</div></div>
 <div class="sec"><button class="go" onclick="goI()">Iniciar inclusão</button><p class="hint">Gerenciamento de Frota → veículos → finaliza → emite docs.</p></div>
 </div>
+<!-- HISTORICO -->
+<div class="mp" id="mode-historico">
+<div class="sec"><div class="st">Histórico de cadastros (7 dias)</div><div class="note">Apagados automaticamente após 7 dias. Clique para carregar.</div>
+<div id="hist-list" style="margin-top:10px"></div>
+<div class="note" id="hist-empty" style="text-align:center;padding:20px">Carregando...</div>
+</div></div>
 </div>
 
 <!-- STATUS -->
@@ -159,12 +165,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <div class="pb"><div class="pf" id="pf"></div></div>
 <div id="stc"></div><div id="erc"></div>
 <div class="da"><div class="st">Documentos</div><div class="dr"><span>Carteirinha.pdf</span><a class="db disabled" id="dc">Aguardando</a></div><div class="dr"><span>Extrato.pdf</span><a class="db disabled" id="de">Aguardando</a></div></div>
+<div class="sec" style="margin-top:16px"><button class="go" onclick="voltarForm()" style="background:var(--tx2)">Voltar ao formulário</button><p class="hint">Seus dados preenchidos serão mantidos</p></div>
 </div>
 </div>
 
 <script>
 let cM='cadastro',cT='cpf',iT='cpf';const vc={c:0,i:0};
-function swM(m){cM=m;document.querySelectorAll('#mt div').forEach((b,i)=>b.classList.toggle('a',['cadastro','arrendamento','inclusao'][i]===m));document.querySelectorAll('.mp').forEach(p=>p.classList.toggle('active',p.id==='mode-'+m));}
+function swM(m){cM=m;document.querySelectorAll('#mt div').forEach(b=>b.classList.toggle('a',b.textContent.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').includes(m.substring(0,4))));document.querySelectorAll('.mp').forEach(p=>p.classList.toggle('active',p.id==='mode-'+m));}
 function swT(t){cT=t;document.querySelectorAll('#tt div').forEach((b,i)=>b.classList.toggle('a',t==='cpf'?i===0:i===1));document.getElementById('cc').style.display=t==='cpf'?'block':'none';document.getElementById('ccn').style.display=t==='cnpj'?'block':'none';document.getElementById('sc').style.display=t==='cpf'?'block':'none';document.getElementById('sn').style.display=t==='cnpj'?'block':'none';}
 function swI(t){iT=t;document.querySelectorAll('#it div').forEach((b,i)=>b.classList.toggle('a',t==='cpf'?i===0:i===1));document.getElementById('ic').style.display=t==='cpf'?'block':'none';document.getElementById('icn').style.display=t==='cnpj'?'block':'none';}
 function aV(x){vc[x]++;const n=vc[x];const l=document.getElementById('vl-'+x);const c=document.createElement('div');c.className='vc';c.innerHTML=`${n>1?'<button class="rmv" onclick="rV(this,\''+x+'\')">×</button>':''}<div class="vh"><span class="vn">Veículo ${n}</span><span class="vt vp" id="${x}t${n}">Próprio</span></div><div class="up" style="margin-bottom:6px"><span>CRLV — placa, renavam, CPF, nome</span><input type="file" accept="image/*,application/pdf" onchange="exD(this,'crlv',${n},'${x}')"></div><div class="r2"><div class="f"><label>Placa</label><input type="text" id="${x}${n}p" style="text-transform:uppercase"></div><div class="f"><label>RENAVAM</label><input type="text" id="${x}${n}r" inputmode="numeric"></div></div><div class="r2"><div class="f"><label>CPF/CNPJ prop.</label><input type="text" id="${x}${n}c" inputmode="numeric"></div><div class="f"><label>Nome prop.</label><input type="text" id="${x}${n}n"></div></div><div class="f"><label>Tipo</label><select id="${x}${n}tp" onchange="uVT('${x}',${n},this.value)"><option value="proprio">Próprio</option><option value="terceiro">Terceiro (arrendamento)</option></select></div>`;l.appendChild(c);}
@@ -217,28 +224,39 @@ function eDl(){const c=document.getElementById('dc'),e=document.getElementById('
 
 // ═══ Salvar cadastro ═══
 async function salvarCadastro(){
-const data=collectFormData();
-const doc=currentType==='cpf'?document.getElementById('login-cpf').value:(document.getElementById('cnpj-selecionar').value||'CNPJ');
-if(!doc.trim()){alert('Preencha o CPF/CNPJ antes de salvar');return;}
+const data=colData();
+const doc=cT==='cpf'?document.getElementById('lc').value:(document.getElementById('cs').value||'CNPJ');
+if(!doc||!doc.trim()){alert('Preencha o CPF/CNPJ antes de salvar');return;}
 try{
-const r=await fetch('/api/historico/salvar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tipo:currentType,documento:doc,dados:data})});
+const r=await fetch('/api/historico/salvar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tipo:cT,documento:doc,dados:data})});
 const j=await r.json();
-if(j.success)alert('Cadastro salvo!');else alert('Erro: '+j.error);
+if(j.success)alert('Cadastro salvo!');else alert('Erro: '+(j.error||''));
 }catch(e){alert('Erro: '+e.message);}
 }
 
-function collectFormData(){
-const data={tipo:currentType,credenciais:{},transportador:{},veiculos:[]};
-if(currentType==='cpf'){
-data.credenciais={cpf:document.getElementById('login-cpf').value,senha:''};
-data.transportador={identidade:document.getElementById('cpf-identidade').value,uf:document.getElementById('cpf-uf').value,cep:document.getElementById('cpf-cep').value,logradouro:document.getElementById('cpf-logradouro').value,numero:document.getElementById('cpf-numero').value,complemento:document.getElementById('cpf-complemento').value,bairro:document.getElementById('cpf-bairro').value};
+function colData(){
+const data={tipo:cT,credenciais:{},transportador:{},veiculos:gV('c')};
+if(cT==='cpf'){
+data.credenciais={cpf:document.getElementById('lc').value,senha:''};
+data.transportador={identidade:document.getElementById('ci').value,uf:document.getElementById('cu').value,cep:document.getElementById('ce').value,logradouro:document.getElementById('cl').value,numero:document.getElementById('cn').value,complemento:document.getElementById('co').value,bairro:document.getElementById('cb').value};
 }else{
 data.credenciais={cpf:'',senha:''};
-data.cnpj_data={cnpj:document.getElementById('cnpj-selecionar').value,cpf_socio:document.getElementById('cnpj-cpf-socio').value};
-data.transportador={cep:document.getElementById('cnpj-cep').value,logradouro:document.getElementById('cnpj-logradouro').value,numero:document.getElementById('cnpj-numero').value,complemento:document.getElementById('cnpj-complemento').value,bairro:document.getElementById('cnpj-bairro').value,telefone:document.getElementById('cnpj-telefone').value,email:document.getElementById('cnpj-email').value};
+data.cnpj_data={cnpj:document.getElementById('cs').value,cpf_socio:document.getElementById('ns').value};
+data.transportador={cep:document.getElementById('ne').value,logradouro:document.getElementById('nl').value,numero:document.getElementById('nn').value,complemento:document.getElementById('nc').value,bairro:document.getElementById('nb').value,telefone:document.getElementById('nt').value,email:document.getElementById('nm').value};
 }
-data.veiculos=collectVehicles('cad');
 return data;
+}
+
+// ═══ Voltar ao formulário ═══
+function voltarForm(){
+document.getElementById('status-screen').classList.remove('active');
+document.getElementById('form-screen').classList.remove('hidden');
+document.getElementById('htitle').textContent='Omega Painel';
+// Reset status
+pg=0;uP();
+document.getElementById('stc').innerHTML='';
+document.getElementById('erc').innerHTML='';
+document.querySelector('.pf').classList.remove('error');
 }
 
 // ═══ Historico ═══
@@ -248,12 +266,12 @@ const r=await fetch('/api/historico/listar');const j=await r.json();
 const list=document.getElementById('hist-list');
 const empty=document.getElementById('hist-empty');
 list.innerHTML='';
-if(!j.items||j.items.length===0){empty.textContent='Nenhum cadastro salvo';return;}
+if(!j.items||j.items.length===0){empty.textContent='Nenhum cadastro salvo';empty.style.display='block';return;}
 empty.style.display='none';
 j.items.forEach(item=>{
 const dt=new Date(item.created_at);
 const when=dt.toLocaleDateString('pt-BR')+' '+dt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
-const badge=item.tipo==='cpf'?'vtp':'vtt';
+const badge=item.tipo==='cpf'?'vp':'vr';
 const card=document.createElement('div');
 card.className='vc';card.style.cursor='pointer';
 card.innerHTML='<div class="vh"><span class="vn">'+item.documento+'</span><span class="vt '+badge+'">'+item.tipo.toUpperCase()+'</span></div><div class="note">'+when+'</div>';
@@ -268,45 +286,52 @@ try{
 const r=await fetch('/api/historico/'+id);const j=await r.json();
 if(!j.success){alert('Erro');return;}
 const d=j.data;
-// Muda pra aba cadastro e tipo correto
-switchTab('cadastro');
-if(j.tipo)switchType(j.tipo);
-// Preenche campos
-if(d.credenciais&&d.credenciais.cpf)document.getElementById('login-cpf').value=d.credenciais.cpf;
+swM('cadastro');
+if(d.tipo)swT(d.tipo);
+if(d.credenciais&&d.credenciais.cpf)document.getElementById('lc').value=d.credenciais.cpf;
 if(d.transportador){
-const t=j.tipo||'cpf';
-if(d.transportador.identidade)document.getElementById('cpf-identidade').value=d.transportador.identidade;
-if(d.transportador.uf)document.getElementById('cpf-uf').value=d.transportador.uf;
-if(d.transportador.cep){const e=document.getElementById(t+'-cep');if(e)e.value=d.transportador.cep;}
-if(d.transportador.logradouro){const e=document.getElementById(t+'-logradouro');if(e)e.value=d.transportador.logradouro;}
-if(d.transportador.numero){const e=document.getElementById(t+'-numero');if(e)e.value=d.transportador.numero;}
-if(d.transportador.complemento){const e=document.getElementById(t+'-complemento');if(e)e.value=d.transportador.complemento;}
-if(d.transportador.bairro){const e=document.getElementById(t+'-bairro');if(e)e.value=d.transportador.bairro;}
-if(d.transportador.telefone)document.getElementById('cnpj-telefone').value=d.transportador.telefone;
-if(d.transportador.email)document.getElementById('cnpj-email').value=d.transportador.email;
+if(d.transportador.identidade)document.getElementById('ci').value=d.transportador.identidade;
+if(d.transportador.uf)document.getElementById('cu').value=d.transportador.uf;
+if(d.tipo==='cpf'){
+if(d.transportador.cep)document.getElementById('ce').value=d.transportador.cep;
+if(d.transportador.logradouro)document.getElementById('cl').value=d.transportador.logradouro;
+if(d.transportador.numero)document.getElementById('cn').value=d.transportador.numero;
+if(d.transportador.complemento)document.getElementById('co').value=d.transportador.complemento;
+if(d.transportador.bairro)document.getElementById('cb').value=d.transportador.bairro;
+}else{
+if(d.transportador.cep)document.getElementById('ne').value=d.transportador.cep;
+if(d.transportador.logradouro)document.getElementById('nl').value=d.transportador.logradouro;
+if(d.transportador.numero)document.getElementById('nn').value=d.transportador.numero;
+if(d.transportador.complemento)document.getElementById('nc').value=d.transportador.complemento;
+if(d.transportador.bairro)document.getElementById('nb').value=d.transportador.bairro;
+if(d.transportador.telefone)document.getElementById('nt').value=d.transportador.telefone;
+if(d.transportador.email)document.getElementById('nm').value=d.transportador.email;
+}
 }
 if(d.cnpj_data){
-if(d.cnpj_data.cnpj)document.getElementById('cnpj-selecionar').value=d.cnpj_data.cnpj;
-if(d.cnpj_data.cpf_socio)document.getElementById('cnpj-cpf-socio').value=d.cnpj_data.cpf_socio;
+if(d.cnpj_data.cnpj)document.getElementById('cs').value=d.cnpj_data.cnpj;
+if(d.cnpj_data.cpf_socio)document.getElementById('ns').value=d.cnpj_data.cpf_socio;
 }
 if(d.veiculos&&d.veiculos.length){
 d.veiculos.forEach((v,i)=>{
-if(i>=vc)addVehicle();
+if(i>=vc.c)aV('c');
 const n=i+1;
-if(v.placa)document.getElementById('cad-v'+n+'-placa').value=v.placa;
-if(v.renavam)document.getElementById('cad-v'+n+'-renavam').value=v.renavam;
-if(v.cpf_cnpj)document.getElementById('cad-v'+n+'-cpf').value=v.cpf_cnpj;
-if(v.nome)document.getElementById('cad-v'+n+'-nome').value=v.nome;
-if(v.tipo){document.getElementById('cad-v'+n+'-tipo').value=v.tipo;updVT('cad',n,v.tipo);}
+if(v.placa)document.getElementById('c'+n+'p').value=v.placa;
+if(v.renavam)document.getElementById('c'+n+'r').value=v.renavam;
+if(v.cpf_cnpj)document.getElementById('c'+n+'c').value=v.cpf_cnpj;
+if(v.nome)document.getElementById('c'+n+'n').value=v.nome;
+if(v.tipo){const s=document.getElementById('c'+n+'tp');if(s){s.value=v.tipo;uVT('c',n,v.tipo);}}
 });
 }
-alert('Cadastro carregado! Confira e preencha a senha.');
+alert('Carregado! Preencha a senha.');
 }catch(e){alert('Erro: '+e.message);}
 }
 
-// Carrega historico quando abre a aba
-const origSwitchTab=switchTab;
-switchTab=function(t){origSwitchTab(t);if(t==='historico')loadHistorico();};
+// Carrega historico quando clica na aba
+const _origSwM=swM;
+swM=function(m){_origSwM(m);if(m==='historico')loadHistorico();};
+// Adiciona modo historico no menu
+document.getElementById('mt').insertAdjacentHTML('beforeend','<div onclick="swM(\'historico\')">Histórico</div>');
 
 </script>
 </body>

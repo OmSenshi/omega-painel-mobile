@@ -96,13 +96,13 @@ class AutomationEngine {
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
       ]
     });
+    this.page = await this.browser.newPage();
     // Anti-deteccao: remove webdriver flag
     await this.page.evaluateOnNewDocument(()=>{
       Object.defineProperty(navigator,'webdriver',{get:()=>false});
       window.chrome={runtime:{}};
       window.navigator.permissions={query:p=>Promise.resolve({state:'granted'})};
     });
-    this.page = await this.browser.newPage();
     await this.page.setViewport({width:1366,height:768});
     const c = await this.page.createCDPSession();
     await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
