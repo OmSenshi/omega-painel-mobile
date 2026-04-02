@@ -107,11 +107,14 @@ class AutomationEngine {
     this.browser = await puppeteer.launch({
       headless: false,
       executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
+      // Remove a flag --enable-automation que mostra a barra "controlled by automated test software"
+      ignoreDefaultArgs: ['--enable-automation'],
       args:[
         '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
         '--window-size=1366,768','--start-maximized',
         '--disable-blink-features=AutomationControlled',
         '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-infobars',
         '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         '--display=' + useDisplay
       ]
@@ -119,8 +122,13 @@ class AutomationEngine {
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
     await this.page.evaluateOnNewDocument(()=>{
+      // Remove flag webdriver
       Object.defineProperty(navigator,'webdriver',{get:()=>false});
-      window.chrome={runtime:{}};
+      // Simula chrome runtime real
+      window.chrome={runtime:{},app:{},csi:()=>{},loadTimes:()=>{}};
+      // Remove navigator.plugins vazio (sinal de automação)
+      Object.defineProperty(navigator,'plugins',{get:()=>[{0:{type:'application/x-google-chrome-pdf'},description:'Portable Document Format',filename:'internal-pdf-viewer',length:1,name:'Chrome PDF Plugin'}]});
+      Object.defineProperty(navigator,'languages',{get:()=>['pt-BR','pt','en-US','en']});
     });
     await this.page.setViewport({width:1366,height:768});
     const ctx = this.browser.defaultBrowserContext();
