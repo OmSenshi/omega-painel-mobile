@@ -392,6 +392,7 @@ class AutomationEngine {
     // Captcha falhou, timeout, ou ainda na tela de CPF — fallback noVNC
     if(screen === 'captcha_erro' || screen === 'cpf_ainda' || screen === 'timeout' || screen === 'desconhecido') {
       this.emit('step',{message:'Login travou ('+screen+'). Use o noVNC pra completar.'});
+    }
 
     // Fallback noVNC
     const a=await this.pauseForError(
