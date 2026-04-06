@@ -104,7 +104,7 @@ class AutomationEngine {
   async initBrowser() {
     this.emit('starting',{message:'Iniciando navegador...'});
     const useDisplay = process.env.DISPLAY || ':99';
-    const proxyUrl = process.env.PROXY_URL || ''; // ex: http://user:pass@proxy.com:port
+    const proxyRaw = process.env.PROXY_URL || '';
 
     // Monta argumentos
     const args = [
@@ -115,10 +115,24 @@ class AutomationEngine {
       '--display=' + useDisplay
     ];
 
-    // Proxy residencial (essencial pra hCaptcha aceitar)
-    if(proxyUrl) {
-      args.push('--proxy-server=' + proxyUrl);
-      this.emit('starting',{message:'Usando proxy: ' + proxyUrl.replace(/\/\/.*@/,'//***@')});
+    // Proxy residencial — parseia URL pra extrair auth separadamente
+    let proxyAuth = null;
+    if(proxyRaw) {
+      // Formato: http://user:pass@host:port ou socks5://user:pass@host:port
+      const match = proxyRaw.match(/^(https?|socks[45h]?):\/\/(?:([^:]+):([^@]+)@)?(.+)$/);
+      if(match) {
+        const [,protocol,user,pass,hostPort] = match;
+        // Chrome só aceita http no --proxy-server
+        args.push('--proxy-server=http://' + hostPort);
+        if(user && pass) {
+          proxyAuth = { username: user, password: pass };
+        }
+        this.emit('starting',{message:'Proxy: ' + hostPort});
+      } else {
+        // Formato simples host:port
+        args.push('--proxy-server=http://' + proxyRaw);
+        this.emit('starting',{message:'Proxy: ' + proxyRaw});
+      }
     }
 
     // Detecta Google Chrome vs Chromium
@@ -158,6 +172,12 @@ class AutomationEngine {
 
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
+
+    // Autenticação do proxy (se tiver user:pass)
+    if(proxyAuth) {
+      await this.page.authenticate(proxyAuth);
+      this.emit('starting',{message:'Proxy autenticado como: ' + proxyAuth.username});
+    }
 
     // Anti-detecção (só se não conectou via connect)
     await this.page.evaluateOnNewDocument(()=>{
