@@ -143,8 +143,9 @@ class AutomationEngine {
     const isGoogleChrome = chromePath.includes('google-chrome');
     this.emit('starting',{message:'Usando: ' + chromePath + (isGoogleChrome ? ' (Google Chrome)' : ' (Chromium)')});
 
-    // Se é Google Chrome, pode usar sandbox. Se é Chromium, precisa --no-sandbox
-    if(!isGoogleChrome) {
+    // Sempre precisa --no-sandbox quando rodando como root
+    const isRoot = process.getuid && process.getuid() === 0;
+    if(!isGoogleChrome || isRoot) {
       args.unshift('--no-sandbox','--disable-setuid-sandbox');
     }
 
