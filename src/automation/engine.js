@@ -1,4 +1,4 @@
-// src/automation/engine.js v2.6 — 2captcha via npm + extensão removida
+// src/automation/engine.js v2.7 — Chrome fantasma + 2captcha coordenadas
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -104,37 +104,78 @@ class AutomationEngine {
   async initBrowser() {
     this.emit('starting',{message:'Iniciando navegador...'});
     const useDisplay = process.env.DISPLAY || ':99';
+    const proxyUrl = process.env.PROXY_URL || ''; // ex: http://user:pass@proxy.com:port
+
+    // Monta argumentos
+    const args = [
+      '--disable-dev-shm-usage',
+      '--window-size=1366,768','--start-maximized',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-infobars',
+      '--display=' + useDisplay
+    ];
+
+    // Proxy residencial (essencial pra hCaptcha aceitar)
+    if(proxyUrl) {
+      args.push('--proxy-server=' + proxyUrl);
+      this.emit('starting',{message:'Usando proxy: ' + proxyUrl.replace(/\/\/.*@/,'//***@')});
+    }
+
+    // Detecta Google Chrome vs Chromium
+    const chromePaths = [
+      process.env.CHROME_PATH,
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium'
+    ].filter(Boolean);
+
+    let chromePath = null;
+    for(const p of chromePaths) {
+      if(fs.existsSync(p)) { chromePath = p; break; }
+    }
+
+    if(!chromePath) {
+      this.emit('starting',{message:'ERRO: Nenhum Chrome/Chromium encontrado!'});
+      throw new Error('Chrome nao encontrado. Instale com: wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && apt install -y /tmp/chrome.deb');
+    }
+
+    const isGoogleChrome = chromePath.includes('google-chrome');
+    this.emit('starting',{message:'Usando: ' + chromePath + (isGoogleChrome ? ' (Google Chrome)' : ' (Chromium)')});
+
+    // Se é Google Chrome, pode usar sandbox. Se é Chromium, precisa --no-sandbox
+    if(!isGoogleChrome) {
+      args.unshift('--no-sandbox','--disable-setuid-sandbox');
+    }
+
     this.browser = await puppeteer.launch({
       headless: false,
-      executablePath: process.env.CHROME_PATH||'/usr/bin/chromium-browser',
-      // Remove a flag --enable-automation que mostra a barra "controlled by automated test software"
+      executablePath: chromePath,
       ignoreDefaultArgs: ['--enable-automation'],
-      args:[
-        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-        '--window-size=1366,768','--start-maximized',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-infobars',
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        '--display=' + useDisplay
-      ]
+      args
     });
+
     const pages = await this.browser.pages();
     this.page = pages[0] || await this.browser.newPage();
+
+    // Anti-detecção (só se não conectou via connect)
     await this.page.evaluateOnNewDocument(()=>{
-      // Remove flag webdriver
-      Object.defineProperty(navigator,'webdriver',{get:()=>false});
-      // Simula chrome runtime real
+      Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
       window.chrome={runtime:{},app:{},csi:()=>{},loadTimes:()=>{}};
-      // Remove navigator.plugins vazio (sinal de automação)
-      Object.defineProperty(navigator,'plugins',{get:()=>[{0:{type:'application/x-google-chrome-pdf'},description:'Portable Document Format',filename:'internal-pdf-viewer',length:1,name:'Chrome PDF Plugin'}]});
+      Object.defineProperty(navigator,'plugins',{get:()=>[{0:{type:'application/x-google-chrome-pdf'},description:'PDF',filename:'internal-pdf-viewer',length:1,name:'Chrome PDF Plugin'}]});
       Object.defineProperty(navigator,'languages',{get:()=>['pt-BR','pt','en-US','en']});
     });
+
     await this.page.setViewport({width:1366,height:768});
+
+    // Nega geolocalização
     const ctx = this.browser.defaultBrowserContext();
     await ctx.overridePermissions('https://sso.acesso.gov.br', []);
-    const c = await this.page.createCDPSession();
-    await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
+
+    try {
+      const c = await this.page.createCDPSession();
+      await c.send('Page.setDownloadBehavior',{behavior:'allow',downloadPath:DOWNLOAD_DIR});
+    } catch(e) {}
   }
 
   // ═══ FLUXO PRINCIPAL ═══
@@ -278,85 +319,23 @@ class AutomationEngine {
     });
     this.emit('step',{message:'CPF digitado: '+cpfDigitado.substring(0,3)+'***'});
 
-    // ── ETAPA 4: Resolve hCaptcha via 2captcha API ANTES de clicar continuar ──
-    // O sitekey é fixo no HTML do gov.br (está no script onLoadHcaptcha)
-    const GOVBR_SITEKEY = '93b08d40-d46c-400a-ba07-6f91cda815b9';
-    this.emit('step',{message:'Resolvendo hCaptcha via 2captcha (pode levar 30-60s)...'});
+    // ── ETAPA 4: Clica Continuar (dispara hCaptcha) ──
+    this.emit('step',{message:'Clicando Continuar...'});
+    await this.page.click('button#enter-account-id').catch(()=>{});
+    await this.delay(3000);
 
-    let captchaToken = null;
-    try {
-      // Tenta extrair sitekey dinamicamente, fallback pro fixo
-      const sitekey = await this.page.evaluate(()=>{
-        const scripts = document.querySelectorAll('script');
-        for(const s of scripts) {
-          const t = s.textContent || '';
-          const m = t.match(/sitekey:\s*["']([a-f0-9-]+)["']/);
-          if(m) return m[1];
-        }
-        const div = document.querySelector('[data-sitekey]');
-        if(div) return div.getAttribute('data-sitekey');
-        return null;
-      }) || GOVBR_SITEKEY;
+    // ── ETAPA 5: Resolve captcha visual via coordenadas ──
+    await this.solveCaptchaVisual();
 
-      this.emit('step',{message:'Sitekey: '+sitekey.substring(0,12)+'... Aguardando 2captcha...'});
-
-      const result = await solver.hcaptcha({
-        sitekey: sitekey,
-        pageurl: this.page.url()
-      });
-
-      if(result && result.data) {
-        captchaToken = result.data;
-        this.emit('step',{message:'Token de captcha recebido!'});
-      }
-    } catch(e) {
-      this.emit('step',{message:'2captcha erro: '+e.message});
-    }
-
-    // ── ETAPA 5: Injeta token e submete ──
-    if(captchaToken) {
-      this.emit('step',{message:'Injetando token e submetendo formulário...'});
-
-      // Injeta o token no campo h-captcha-response e submete via callback
-      await this.page.evaluate((token)=>{
-        // Preenche TODOS os campos de resposta do hCaptcha
-        document.querySelectorAll('textarea[name*="captcha-response"], [name="h-captcha-response"]').forEach(el=>{
-          el.value = token;
-          el.textContent = token;
-        });
-
-        // Configura o campo de operação pro submit
-        const opField = document.getElementById('operation-field');
-        if(opField) {
-          opField.setAttribute('name', 'operation');
-          opField.setAttribute('value', 'enter-account-id');
-        }
-
-        // Submete o form diretamente (bypassa o clique no botão que dispara hCaptcha visual)
-        const form = document.getElementById('loginData');
-        if(form) form.submit();
-      }, captchaToken);
-
-    } else {
-      // Sem token — clica continuar e deixa o captcha visual aparecer (fallback noVNC)
-      this.emit('step',{message:'Sem token, clicando continuar (captcha visual vai aparecer)...'});
-      await this.page.click('button#enter-account-id').catch(()=>{});
-    }
-
-    // ── ETAPA 6: Aguarda resultado com waitForSelector obrigatório ──
-    this.emit('step',{message:'Aguardando tela de senha carregar (até 90s)...'});
-
-    // Primeiro tenta waitForSelector direto pro campo de senha (mais confiável que polling)
+    // ── ETAPA 6: Aguarda resultado ──
+    this.emit('step',{message:'Aguardando tela de senha (ate 90s)...'});
     let screen = null;
     try {
-      // Aguarda qualquer um destes aparecer: senha, 2FA, ou erro
       await this.page.waitForFunction(()=>{
         return document.querySelector('input#password[type="password"]') ||
                document.querySelector('input#otpInput') ||
                (window.location.href.includes('rntrcdigital.antt.gov.br') && !window.location.href.includes('acesso.gov.br'));
       }, {timeout: 90000});
-
-      // Detecta qual tela apareceu
       screen = await this.page.evaluate(()=>{
         if(document.querySelector('input#password[type="password"]')) return 'senha';
         if(document.querySelector('input#otpInput')) return '2fa';
@@ -364,7 +343,6 @@ class AutomationEngine {
         return 'desconhecido';
       });
     } catch(e) {
-      // Timeout — verifica se ficou no captcha ou outro erro
       screen = await this.page.evaluate(()=>{
         const alertas = document.querySelectorAll('.alert-danger,.alert-warning');
         for(const a of alertas) {
@@ -409,6 +387,120 @@ class AutomationEngine {
     );
     if(a==='stop')return;
     await this.verificaLoginFinal();
+  }
+
+  // ═══ RESOLVE CAPTCHA VISUAL VIA COORDENADAS (2captcha API) ═══
+  async solveCaptchaVisual() {
+    // Verifica se o captcha visual apareceu (iframe do hcaptcha)
+    const hasCaptcha = await this.page.evaluate(()=>{
+      return !!document.querySelector('iframe[src*="hcaptcha.com/captcha"]') ||
+             !!document.querySelector('.h-captcha') ||
+             !!document.querySelector('[data-hcaptcha-widget-id]');
+    });
+
+    if(!hasCaptcha) {
+      this.emit('step',{message:'Sem captcha visual detectado'});
+      return;
+    }
+
+    this.emit('step',{message:'Captcha visual detectado! Resolvendo via 2captcha...'});
+
+    // Tenta resolver até 3 vezes
+    for(let attempt=1; attempt<=3; attempt++) {
+      this.emit('step',{message:'Resolvendo captcha (tentativa '+attempt+'/3)...'});
+
+      try {
+        // Tira screenshot da página inteira
+        const screenshotBuffer = await this.page.screenshot({encoding:'base64'});
+
+        // Envia pro 2captcha como captcha de coordenadas
+        // O 2captcha vai analisar a imagem e retornar as coordenadas dos itens corretos
+        const result = await solver.coordinates({
+          body: screenshotBuffer,
+          textinstructions: 'Click on the correct images as indicated by the captcha challenge shown in the popup',
+          imginstructions: screenshotBuffer
+        });
+
+        if(result && result.data) {
+          this.emit('step',{message:'Coordenadas recebidas! Clicando...'});
+
+          // result.data vem como array de {x, y} ou string "x=123,y=456|x=789,y=012"
+          let coords = [];
+          if(Array.isArray(result.data)) {
+            coords = result.data;
+          } else if(typeof result.data === 'string') {
+            // Parse formato "x=123,y=456|x=789,y=012"
+            coords = result.data.split('|').map(pair=>{
+              const parts = {};
+              pair.split(',').forEach(p=>{
+                const [k,v] = p.split('=');
+                parts[k.trim()] = parseInt(v.trim());
+              });
+              return parts;
+            }).filter(c=>c.x && c.y);
+          }
+
+          if(coords.length > 0) {
+            // Clica em cada coordenada com delay humano
+            for(const coord of coords) {
+              // Delay aleatório entre 300ms e 800ms (simula humano)
+              const humanDelay = 300 + Math.floor(Math.random() * 500);
+              await this.delay(humanDelay);
+
+              // Move o mouse suavemente até o ponto
+              await this.page.mouse.move(coord.x, coord.y, {steps: 5 + Math.floor(Math.random()*10)});
+              await this.delay(100 + Math.floor(Math.random()*200));
+              await this.page.mouse.click(coord.x, coord.y);
+
+              this.emit('step',{message:'Clicou em ('+coord.x+','+coord.y+')'});
+            }
+
+            // Aguarda um pouco e clica no botão de verificar/avançar do hcaptcha
+            await this.delay(1000);
+
+            // Procura e clica no botão de submit do hcaptcha
+            const submitBtn = await this.page.$('.button-submit') ||
+                              await this.page.$('[data-action="submit"]');
+            if(submitBtn) {
+              await submitBtn.click();
+              this.emit('step',{message:'Captcha submetido!'});
+            } else {
+              // Tenta clicar via evaluate nos frames
+              const frames = this.page.frames();
+              for(const frame of frames) {
+                try {
+                  await frame.click('.button-submit').catch(()=>{});
+                } catch{}
+              }
+            }
+
+            await this.delay(3000);
+
+            // Verifica se avançou
+            const advanced = await this.page.evaluate(()=>{
+              return !!document.querySelector('input#password[type="password"]') ||
+                     !!document.querySelector('input#otpInput') ||
+                     window.location.href.includes('rntrcdigital.antt.gov.br');
+            });
+
+            if(advanced) {
+              this.emit('step',{message:'Captcha resolvido com sucesso!'});
+              return;
+            }
+
+            // Se não avançou, pode ter selecionado errado — tenta de novo
+            this.emit('step',{message:'Captcha pode ter falhado, tentando novamente...'});
+          }
+        }
+      } catch(e) {
+        this.emit('step',{message:'2captcha coordenadas erro: '+e.message});
+      }
+
+      await this.delay(2000);
+    }
+
+    // Se após 3 tentativas não resolveu, fallback noVNC
+    this.emit('step',{message:'Captcha nao resolvido automaticamente. Use o noVNC se necessario.'});
   }
 
   // ── Preenche senha ──
